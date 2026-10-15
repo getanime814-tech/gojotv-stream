@@ -36,7 +36,6 @@ export async function fetchAnivexa(
   const tasks: Array<Promise<StreamServer | null>> = [];
 
   for (const { provider, serverName } of PROVIDERS) {
-    // Sub
     tasks.push(
       fetchOne({
         baseUrl,
@@ -48,7 +47,6 @@ export async function fetchAnivexa(
         timeoutMs,
       })
     );
-    // Dub
     tasks.push(
       fetchOne({
         baseUrl,
@@ -126,13 +124,16 @@ async function fetchOne(params: {
     if (data.error || !data.streams || data.streams.length === 0) return null;
 
     const embed = data.streams.find((s) => s.embedUrl);
-    const url_ = embed?.embedUrl ?? data.streams[0]?.url;
+    const rawUrl = embed?.embedUrl ?? data.streams[0]?.url;
 
-    if (!url_) return null;
+    if (!rawUrl) return null;
+
+    // ✅ Fix: Ensure megaplay.buzz URLs have /videojs/ segment for iframe playback
+    const finalUrl = normalizeMegaplayUrl(rawUrl);
 
     return {
       server: serverName,
-      url: url_,
+      url: finalUrl,
       source: "anivexa",
     };
   } catch {
@@ -140,4 +141,25 @@ async function fetchOne(params: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ============================================================
+// NORMALIZE MEGAPLAY URL
+// https://megaplay.buzz/stream/... → https://megaplay.buzz/videojs/stream/...
+// (Only if /videojs/ segment is missing)
+// ============================================================
+function normalizeMegaplayUrl(url: string): string {
+  if (!url || typeof url !== "string") return url;
+
+  // Only apply to megaplay.buzz hosts
+  if (!url.includes("megaplay.buzz")) return url;
+
+  // Already has /videojs/? Return as-is
+  if (url.includes("megaplay.buzz/videojs/")) return url;
+
+  // Replace "megaplay.buzz/" with "megaplay.buzz/videojs/"
+  return url.replace(
+    /(https?:\/\/megaplay\.buzz)\//,
+    "$1/videojs/"
+  );
 }
