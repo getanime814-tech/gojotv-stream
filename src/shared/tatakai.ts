@@ -8,7 +8,8 @@ import type {
 } from "./types";
 
 // ============================================================
-// TATAKAI CLIENT — Final v6 (safe priority, no wrong episodes)
+// TATAKAI CLIENT — Final v7
+// Handles both hindi dubbed + desi dub with max accuracy
 // ============================================================
 
 interface FetchTatakaiArgs {
@@ -113,9 +114,12 @@ async function fetchHindiDubbed(
     const url = pickHindiServerUrl(list, episode, isMovie);
     if (!url) continue;
 
+    const cleanUrl = extractUrl(url);
+    if (!cleanUrl) continue;
+
     result.servers.push({
       server: name,
-      url,
+      url: cleanUrl,
       source: "tatakai-hindi",
     });
   }
@@ -124,7 +128,7 @@ async function fetchHindiDubbed(
 }
 
 // ============================================================
-// DESI DUB — SAFE PRIORITY (v6 fix)
+// DESI DUB (desidubanime) — prefix-aware + iframe-safe
 // ============================================================
 async function fetchDesiDub(
   baseUrl: string,
@@ -145,7 +149,7 @@ async function fetchDesiDub(
   const animeId = search.slug;
 
   // ============================================================
-  // Fetch info
+  // Fetch info — extract real episode prefix
   // ============================================================
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
   const info = await fetchJsonWithRetry<DesiDubInfoResponse>(
@@ -153,6 +157,19 @@ async function fetchDesiDub(
     timeoutMs,
     1
   );
+
+  const infoEpisodes = info.ok ? info.data?.data?.episodes : undefined;
+
+  // Extract real prefix from first info entry
+  // e.g., "kimetsu-no-yaiba-episode-26" → "kimetsu-no-yaiba"
+  let realPrefix = animeId;
+  if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
+    const firstId = infoEpisodes[0]?.id;
+    if (firstId) {
+      const m = firstId.match(/^(.+?)-episode-\d+$/);
+      if (m?.[1]) realPrefix = m[1];
+    }
+  }
 
   const candidates: string[] = [];
   const addSlug = (s: string | undefined | null) => {
@@ -162,13 +179,12 @@ async function fetchDesiDub(
     candidates.push(trimmed);
   };
 
-  const infoEpisodes = info.ok ? info.data?.data?.episodes : undefined;
-
-  // ✅ Rule 2 (v6): Trust is_movie from W6 only
-  // "Full Movie" title alone is NOT enough — DesiDub often mislabels
   const movieDetected = isMovie;
 
-  // ✅ PRIORITY 1: Info number-match (accurate)
+  // PRIORITY 1: Real prefix + episode N (most accurate)
+  addSlug(`${realPrefix}-episode-${episode}`);
+
+  // PRIORITY 2: Info number-match
   if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
     const byNumber = infoEpisodes.find((e) => e.number === episode);
     if (byNumber?.id) addSlug(byNumber.id);
@@ -176,10 +192,7 @@ async function fetchDesiDub(
     result.timedOut = true;
   }
 
-  // ✅ PRIORITY 2: Constructed slug (user's pattern)
-  addSlug(`${animeId}-episode-${episode}`);
-
-  // ✅ PRIORITY 3: Info index-match (episode-1 position)
+  // PRIORITY 3: Info index-match
   if (
     Array.isArray(infoEpisodes) &&
     episode > 0 &&
@@ -189,34 +202,18 @@ async function fetchDesiDub(
     if (byIndex?.id) addSlug(byIndex.id);
   }
 
-  // ✅ PRIORITY 4: Other constructed patterns
+  // PRIORITY 4: Search slug fallback
+  addSlug(`${animeId}-episode-${episode}`);
   addSlug(`${animeId}-${episode}`);
-  addSlug(`${animeId}-ep-${episode}`);
-  addSlug(`${animeId}-episode-${episode}-english`);
 
-  // ✅ PRIORITY 5 (v6 RULE 1): Info first-entry ONLY if number matches
-  // ──────────────────────────────────────────────────────────
-  // The v5 bug: S1E8 request served S1E26 due to info first-entry fallback
-  // The v6 fix: only use info first-entry if it's truly the same episode
-  // ──────────────────────────────────────────────────────────
-  if (Array.isArray(infoEpisodes) && infoEpisodes.length === 1) {
-    const onlyEp = infoEpisodes[0];
-    const numberMatches = onlyEp?.number === episode;
-    const isEpisode1 = episode === 1;
-
-    if ((numberMatches || isEpisode1) && onlyEp?.id) {
-      addSlug(onlyEp.id);
-    }
-    // Otherwise SKIP — do not serve wrong episode
-  }
-
-  // ✅ PRIORITY 6: Movie bare slug (only if isMovie from W6)
+  // PRIORITY 5: Movie bare slug
   if (movieDetected) {
     addSlug(animeId);
+    addSlug(realPrefix);
   }
 
   // ============================================================
-  // Try each candidate in SAFE ORDER
+  // Try each candidate
   // ============================================================
   let sources: Array<{ server: string; url: string }> = [];
 
@@ -241,7 +238,7 @@ async function fetchDesiDub(
   if (sources.length === 0) return result;
 
   // ============================================================
-  // Map to StreamServer
+  // Map to StreamServer (with iframe extraction)
   // ============================================================
   const nameMap: Record<string, string> = {
     Mirrordub: "Mirror",
@@ -254,14 +251,44 @@ async function fetchDesiDub(
 
   for (const src of sources) {
     if (!src.url) continue;
+
+    const cleanUrl = extractUrl(src.url);
+    if (!cleanUrl) continue;
+
     result.servers.push({
       server: nameMap[src.server] ?? src.server,
-      url: src.url,
+      url: cleanUrl,
       source: "tatakai-desi",
     });
   }
 
   return result;
+}
+
+// ============================================================
+// EXTRACT CLEAN URL — handles iframe HTML + protocol-relative
+// ============================================================
+function extractUrl(input: string): string | null {
+  if (!input || typeof input !== "string") return null;
+  const trimmed = input.trim();
+
+  // Iframe HTML: <iframe src="..." /> or <iframe src='...' />
+  const iframeMatch = trimmed.match(/<iframe[^>]*\ssrc=["']([^"']+)["']/i);
+  if (iframeMatch?.[1]) {
+    let url = iframeMatch[1].trim();
+    if (url.startsWith("//")) url = "https:" + url;
+    return url;
+  }
+
+  // Plain URL
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("//")) {
+    return "https:" + trimmed;
+  }
+
+  return null;
 }
 
 // ============================================================
@@ -337,7 +364,7 @@ async function searchDesiDub(
 }
 
 // ============================================================
-// TITLE VARIANT GENERATOR
+// TITLE VARIANT GENERATOR (10-12 variants per title)
 // ============================================================
 function generateTitleVariants(titles: string[]): string[] {
   const seen = new Set<string>();
@@ -357,7 +384,6 @@ function generateTitleVariants(titles: string[]): string[] {
     if (!t) continue;
 
     push(t);
-
     push(t.replace(/\s+(season|part|cour)\s*\d+/gi, " ").trim());
     push(t.replace(/\s+\d+(?:st|nd|rd|th)\s+season/gi, " ").trim());
     push(t.replace(/\s+final\s+season/gi, " ").trim());
