@@ -6,7 +6,7 @@ import type { StreamResponse } from "./types";
 // invalidate old cache automatically)
 // ============================================================
 
-const CACHE_PREFIX = "stream:v2:";
+const CACHE_PREFIX = "stream:v3:";
 
 interface RedisEnv {
   UPSTASH_REDIS_REST_URL: string;
