@@ -1,14 +1,11 @@
 // ============================================================
-// SELF-PROXY API CLIENT — Final v4 (Production Ready)
+// SELF-PROXY API CLIENT — v5 (Merge-All-Slugs)
 // ============================================================
-// Fixes over v3:
-//   • Correct slug priority (DB slug first)
-//   • No early return on error/timeout — tries all candidates
-//   • Strict response validation
-//   • Sanitized base URL
-//   • Optional empty title params skipped
-//   • Detailed debug logging (opt-in)
-//   • Handles all edge cases: 400, 404, 5xx, timeout, malformed JSON
+// Fixes over v4:
+//   • NO early return on "ok" — tries ALL slugs
+//   • Merges results across slugs (deduped by URL)
+//   • Hindi servers never lost due to partial slug match
+//   • All v4 validations retained
 // ============================================================
 
 import type {
@@ -52,7 +49,7 @@ interface AttemptArgs {
 }
 
 // ============================================================
-// MAIN FETCH (multi-slug strategy, bulletproof)
+// MAIN FETCH — Try all slugs, merge results
 // ============================================================
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
@@ -70,7 +67,7 @@ export async function fetchSelfProxy(
     debug = false,
   } = args;
 
-  // ---- Guard: Base URL ----
+  // ---- Base URL guard ----
   if (!baseUrl || typeof baseUrl !== "string") {
     if (debug) console.warn("[SelfProxy] Missing base URL");
     return emptyResult("error");
@@ -82,12 +79,11 @@ export async function fetchSelfProxy(
     return emptyResult("error");
   }
 
-  // ---- Spec Rule 3 & 7: Movies must be season=1, episode=1 ----
+  // ---- Movie: force season=1, episode=1 ----
   const finalSeason = isMovie ? 1 : Math.max(1, season || 1);
   const finalEpisode = isMovie ? 1 : Math.max(1, episode || 1);
 
-  // ---- Spec Rule 1: Both titles sent separately ----
-  // Build clean fallback chain (never send empty strings)
+  // ---- Title fallback chain ----
   const rawEnglish = (englishTitle || "").trim();
   const rawRomaji = (romajiTitle || "").trim();
   const slugAsTitle = (slug || "").replace(/-/g, " ").trim();
@@ -95,30 +91,31 @@ export async function fetchSelfProxy(
   const safeEnglish = rawEnglish || rawRomaji || slugAsTitle;
   const safeRomaji = rawRomaji || rawEnglish || slugAsTitle;
 
-  // ---- Multi-slug candidates (PRIORITY ORDER FIXED) ----
-  //   1. DB slug (AniList canonical) — most reliable
-  //   2. English-generated slug
-  //   3. Romaji-generated slug
+  // ---- Slug candidates: ALL tried, results merged ----
+  // Priority order only affects which one is tried FIRST
+  // (result ordering in merged output follows candidate order)
   const candidates = dedupeStrings([
-    (slug || "").trim(),
-    generateSlug(rawEnglish),
-    generateSlug(rawRomaji),
+    (slug || "").trim(),              // DB slug first
+    generateSlug(rawEnglish),         // English slug second
+    generateSlug(rawRomaji),          // Romaji slug third
   ]);
 
   if (candidates.length === 0) {
-    if (debug) console.warn("[SelfProxy] No slug candidates generated");
+    if (debug) console.warn("[SelfProxy] No slug candidates");
     return emptyResult("empty");
   }
 
   if (debug) {
     console.log("[SelfProxy] Candidate slugs:", candidates);
-    console.log("[SelfProxy] Titles:", { english: safeEnglish, romaji: safeRomaji });
     console.log("[SelfProxy] Season/Episode:", { season: finalSeason, episode: finalEpisode });
   }
 
-  // ---- Try each slug, keep going on failure ----
-  let bestEmptyResult: SelfProxyResult = emptyResult("empty");
-  let lastErrorResult: SelfProxyResult | null = null;
+  // ---- Try ALL slugs, collect results ----
+  const aggregated: SelfProxyResult = emptyResult("empty");
+  const seenUrls = new Set<string>();
+  let hasTimeout = false;
+  let hasError = false;
+  let hasAny = false;
 
   for (let i = 0; i < candidates.length; i++) {
     const trySlug = candidates[i];
@@ -141,35 +138,65 @@ export async function fetchSelfProxy(
     });
 
     if (debug) {
-      console.log(`[SelfProxy] Result for "${trySlug}": status=${result.status}, servers=${
-        result.eng_sub.length + result.eng_dub.length + result.hindi.length
-      }`);
+      const c =
+        result.eng_sub.length + result.eng_dub.length + result.hindi.length;
+      console.log(`[SelfProxy] Result for "${trySlug}": status=${result.status}, servers=${c}`);
     }
 
-    // ✅ Success — return immediately
-    if (result.status === "ok") return result;
+    // Merge into aggregated (dedupe by URL)
+    mergeInto(aggregated, result, seenUrls);
 
-    // ⚠️ Error/timeout — remember, but KEEP TRYING other slugs
-    if (result.status === "error" || result.status === "timeout") {
-      if (!lastErrorResult) lastErrorResult = result;
-      continue;
-    }
-
-    // ⚠️ Empty — remember first empty, try next slug
-    if (result.status === "empty" && bestEmptyResult.status === "empty") {
-      bestEmptyResult = result;
-    }
+    if (result.status === "ok") hasAny = true;
+    if (result.status === "timeout") hasTimeout = true;
+    if (result.status === "error") hasError = true;
   }
 
-  // All candidates exhausted
+  // ---- Determine final status ----
+  if (hasAny) {
+    aggregated.status = "ok";
+  } else if (hasTimeout) {
+    aggregated.status = "timeout";
+  } else if (hasError) {
+    aggregated.status = "error";
+  } else {
+    aggregated.status = "empty";
+  }
+
   if (debug) {
-    console.warn("[SelfProxy] All candidates failed. Returning best result.");
+    const c = aggregated.eng_sub.length + aggregated.eng_dub.length + aggregated.hindi.length;
+    console.log(`[SelfProxy] Merged total: ${c} servers, status=${aggregated.status}`);
   }
-  return lastErrorResult || bestEmptyResult;
+
+  return aggregated;
 }
 
 // ============================================================
-// SINGLE ATTEMPT (strict validation)
+// MERGE HELPER — dedupe by URL
+// ============================================================
+function mergeInto(
+  target: SelfProxyResult,
+  src: SelfProxyResult,
+  seenUrls: Set<string>
+): void {
+  for (const s of src.eng_sub) {
+    if (!s.url || seenUrls.has(s.url)) continue;
+    seenUrls.add(s.url);
+    target.eng_sub.push(s);
+  }
+  for (const s of src.eng_dub) {
+    if (!s.url || seenUrls.has(s.url)) continue;
+    seenUrls.add(s.url);
+    target.eng_dub.push(s);
+  }
+  for (const s of src.hindi) {
+    if (!s.url || seenUrls.has(s.url)) continue;
+    seenUrls.add(s.url);
+    target.hindi.push(s);
+  }
+}
+
+// ============================================================
+// SINGLE ATTEMPT
 // ============================================================
 async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
   const {
@@ -184,7 +211,7 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
     debug = false,
   } = args;
 
-  // ---- Build query params (only non-empty values) ----
+  // ---- Build query params ----
   const params = new URLSearchParams();
   params.set("slug", slug);
   params.set("season", String(season));
@@ -201,10 +228,9 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
   }
 
   const url = `${baseUrl}/api/streaming?${params.toString()}`;
-
   if (debug) console.log("[SelfProxy] Fetching:", url);
 
-  // ---- Timeout setup ----
+  // ---- Timeout ----
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
 
@@ -218,7 +244,6 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
       signal: controller.signal,
     });
 
-    // ---- HTTP status handling ----
     if (res.status === 400 || res.status === 404) {
       if (debug) console.log(`[SelfProxy] HTTP ${res.status} → empty`);
       return emptyResult("empty");
@@ -229,7 +254,6 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
       return emptyResult("error");
     }
 
-    // ---- Parse JSON safely ----
     let data: SelfProxyResponse;
     try {
       data = (await res.json()) as SelfProxyResponse;
@@ -238,43 +262,30 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
       return emptyResult("error");
     }
 
-    // ---- Strict response validation ----
+    // ---- Strict validation ----
     if (!data || typeof data !== "object") {
-      if (debug) console.warn("[SelfProxy] Invalid response object");
       return emptyResult("empty");
     }
-
     if (data.success !== true) {
-      if (debug) console.log("[SelfProxy] success !== true");
       return emptyResult("empty");
     }
-
     if (!data.data || typeof data.data !== "object") {
-      if (debug) console.log("[SelfProxy] Missing data object");
       return emptyResult("empty");
     }
-
     if (!Array.isArray(data.data.servers)) {
-      if (debug) console.log("[SelfProxy] servers is not an array");
       return emptyResult("empty");
     }
-
     if (data.data.servers.length === 0) {
-      if (debug) console.log("[SelfProxy] Empty servers array");
       return emptyResult("empty");
     }
 
-    // ---- Map servers ----
     return mapSelfProxyServers(data.data.servers);
   } catch (err) {
     const isAbort =
       err instanceof Error &&
       (err.name === "AbortError" || err.message.includes("aborted"));
 
-    if (debug) {
-      console.warn("[SelfProxy] Fetch error:", err);
-    }
-
+    if (debug) console.warn("[SelfProxy] Fetch error:", err);
     return emptyResult(isAbort ? "timeout" : "error");
   } finally {
     clearTimeout(timer);
@@ -282,7 +293,7 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
 }
 
 // ============================================================
-// SLUG GENERATION (Spec Rules)
+// SLUG GENERATION
 // ============================================================
 function generateSlug(title: string): string {
   if (!title || typeof title !== "string") return "";
@@ -313,7 +324,7 @@ function dedupeStrings(arr: Array<string | undefined | null>): string[] {
 }
 
 // ============================================================
-// EMPTY RESULT HELPER
+// EMPTY RESULT
 // ============================================================
 function emptyResult(status: SelfProxyResult["status"]): SelfProxyResult {
   return {
@@ -336,7 +347,7 @@ function stripProviderPrefix(name: string): string {
 }
 
 // ============================================================
-// MAP SERVERS (grouped by type/language)
+// MAP SERVERS
 // ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
@@ -344,8 +355,6 @@ function mapSelfProxyServers(
   const eng_sub: StreamServer[] = [];
   const eng_dub: StreamServer[] = [];
   const hindi: StreamServer[] = [];
-
-  // Dedupe by URL to avoid duplicate servers
   const seenUrls = new Set<string>();
 
   for (const s of servers) {
@@ -353,10 +362,7 @@ function mapSelfProxyServers(
     if (!s.embed_url || !s.server_name) continue;
 
     const url = s.embed_url.trim();
-    if (!url) continue;
-
-    // Skip duplicates
-    if (seenUrls.has(url)) continue;
+    if (!url || seenUrls.has(url)) continue;
     seenUrls.add(url);
 
     const cleanName = stripProviderPrefix(s.server_name);
@@ -364,11 +370,11 @@ function mapSelfProxyServers(
 
     const mapped: StreamServer = {
       server: cleanName,
-      url: url,
+      url,
       source: "self",
     };
 
-    // Group by type + language
+    // Grouping by type + language
     if (s.type === "sub" && s.language === "english") {
       eng_sub.push(mapped);
     } else if (s.type === "dub" && s.language === "english") {
@@ -376,16 +382,13 @@ function mapSelfProxyServers(
     } else if (s.type === "dub" && s.language === "multi-audio") {
       hindi.push(mapped);
     } else if (s.type === "sub") {
-      // Fallback: any sub not marked english goes to eng_sub
       eng_sub.push(mapped);
     } else if (s.type === "dub") {
-      // Fallback: any dub not marked english/multi goes to hindi
       hindi.push(mapped);
     }
   }
 
   const total = eng_sub.length + eng_dub.length + hindi.length;
-
   return {
     eng_sub,
     eng_dub,
