@@ -1,20 +1,37 @@
-import { Redis } from "@upstash/redis";
 import type { StreamResponse } from "./types";
 
-// ============ REDIS CLIENT (singleton) ============
-let redisClient: Redis | null = null;
+// ============================================================
+// UPSTASH REDIS CLIENT — Direct REST API (no SDK)
+// ============================================================
 
-export function getRedis(env: {
+interface RedisEnv {
   UPSTASH_REDIS_REST_URL: string;
   UPSTASH_REDIS_REST_TOKEN: string;
-}): Redis {
-  if (!redisClient) {
-    redisClient = new Redis({
-      url: env.UPSTASH_REDIS_REST_URL,
-      token: env.UPSTASH_REDIS_REST_TOKEN,
-    });
+}
+
+// ============ LOW-LEVEL COMMAND ============
+async function upstashCommand(
+  env: RedisEnv,
+  command: (string | number)[]
+): Promise<any> {
+  const res = await fetch(env.UPSTASH_REDIS_REST_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Upstash HTTP ${res.status}`);
   }
-  return redisClient;
+
+  const data = (await res.json()) as { result: any; error?: string };
+  if (data.error) {
+    throw new Error(`Upstash: ${data.error}`);
+  }
+  return data.result;
 }
 
 // ============ CACHE KEY ============
@@ -24,15 +41,25 @@ export function cacheKey(anilistId: number, episode: number): string {
 
 // ============ GET CACHED ============
 export async function getCached(
-  redis: Redis,
+  env: RedisEnv,
   anilistId: number,
   episode: number
 ): Promise<StreamResponse | null> {
   try {
     const key = cacheKey(anilistId, episode);
-    const cached = await redis.get<StreamResponse>(key);
-    if (cached && typeof cached === "object") {
-      return { ...cached, cached: true };
+    const raw = await upstashCommand(env, ["GET", key]);
+
+    if (!raw) return null;
+
+    let parsed: StreamResponse;
+    if (typeof raw === "string") {
+      parsed = JSON.parse(raw) as StreamResponse;
+    } else {
+      parsed = raw as StreamResponse;
+    }
+
+    if (parsed && typeof parsed === "object") {
+      return { ...parsed, cached: true };
     }
     return null;
   } catch (err) {
@@ -43,7 +70,7 @@ export async function getCached(
 
 // ============ SET CACHED ============
 export async function setCached(
-  redis: Redis,
+  env: RedisEnv,
   anilistId: number,
   episode: number,
   response: StreamResponse,
@@ -52,7 +79,9 @@ export async function setCached(
   try {
     const key = cacheKey(anilistId, episode);
     const toStore: StreamResponse = { ...response, cached: false };
-    await redis.set(key, toStore, { ex: ttlSeconds });
+    const serialized = JSON.stringify(toStore);
+
+    await upstashCommand(env, ["SET", key, serialized, "EX", ttlSeconds]);
   } catch (err) {
     console.error(`[Redis] SET error: ${err}`);
   }
