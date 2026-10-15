@@ -20,15 +20,17 @@ export async function resolveStreams(
 ): Promise<StreamResponse> {
   const ttl = parseInt(env.CACHE_TTL_SECONDS, 10);
 
+  // 1. Cache check
   if (!options.skipCache) {
     const cached = await getCached(env, req.anilist_id, req.episode);
     if (cached) return cached;
   }
 
+  // 2. Prepare titles
   const englishTitle = req.english_title?.trim() || req.title?.trim() || "";
   const romajiTitle = req.romaji_title?.trim() || englishTitle;
 
-  // Fire both sources in parallel
+  // 3. Fire both sources in parallel
   const [selfResult, anivexaResult] = await Promise.allSettled([
     fetchSelfProxy({
       baseUrl: env.SELF_PROXY_BASE,
@@ -49,14 +51,18 @@ export async function resolveStreams(
     }),
   ]);
 
-  const self = selfResult.status === "fulfilled"
-    ? selfResult.value
-    : { eng_sub: [], eng_dub: [], hindi: [], status: "error" as const };
+  // 4. Extract results safely
+  const self =
+    selfResult.status === "fulfilled"
+      ? selfResult.value
+      : { eng_sub: [], eng_dub: [], hindi: [], status: "error" as const };
 
-  const anivexa = anivexaResult.status === "fulfilled"
-    ? anivexaResult.value
-    : { eng_sub: [], eng_dub: [], status: "error" as const };
+  const anivexa =
+    anivexaResult.status === "fulfilled"
+      ? anivexaResult.value
+      : { eng_sub: [], eng_dub: [], status: "error" as const };
 
+  // 5. Merge
   const merged = mergeAllSources({
     self: {
       eng_sub: self.eng_sub,
@@ -67,9 +73,9 @@ export async function resolveStreams(
       eng_sub: anivexa.eng_sub,
       eng_dub: anivexa.eng_dub,
     },
-    tatakai: { hindi: [] },
   });
 
+  // 6. Build response
   const response: StreamResponse = {
     anilist_id: req.anilist_id,
     episode: req.episode,
@@ -84,6 +90,7 @@ export async function resolveStreams(
     resolved_at: new Date().toISOString(),
   };
 
+  // 7. Cache write (only if we got at least one server)
   const total =
     merged.eng_sub.length + merged.eng_dub.length + merged.hindi.length;
 
@@ -95,12 +102,13 @@ export async function resolveStreams(
 }
 
 // ============================================================
-// PREFETCH
+// PREFETCH — schedule next episode (no delay)
 // ============================================================
 export async function schedulePrefetch(
   req: StreamRequest,
   env: Env
 ): Promise<void> {
+  // Skip if last episode
   if (req.total_episodes && req.episode >= req.total_episodes) return;
 
   const nextJob: PrefetchJob = {
