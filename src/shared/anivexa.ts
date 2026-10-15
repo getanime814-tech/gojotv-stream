@@ -1,8 +1,7 @@
 import type { StreamServer, AnivexaWatchResponse } from "./types";
 
 // ============================================================
-// ANIVEXA API CLIENT
-// Provider names hidden — mapped to neutral display names
+// ANIVEXA API CLIENT — Animegg only
 // ============================================================
 
 interface FetchAnivexaArgs {
@@ -18,16 +17,11 @@ interface AnivexaResult {
   status: "ok" | "empty" | "timeout" | "error";
 }
 
-// ✅ Neutral display names (no provider branding)
-const PROVIDERS: Array<{
-  provider: string;
-  serverName: string;
-}> = [
-  { provider: "anikoto", serverName: "MG play" },
+// ✅ Only Animegg (Anikoto comes from self-proxy)
+const PROVIDERS: Array<{ provider: string; serverName: string }> = [
   { provider: "animegg", serverName: "GG play" },
 ];
 
-// ============ MAIN FETCH (parallel) ============
 export async function fetchAnivexa(
   args: FetchAnivexaArgs
 ): Promise<AnivexaResult> {
@@ -90,7 +84,6 @@ export async function fetchAnivexa(
   return { eng_sub, eng_dub, status };
 }
 
-// ============ FETCH SINGLE STREAM ============
 async function fetchOne(params: {
   baseUrl: string;
   provider: string;
@@ -124,16 +117,12 @@ async function fetchOne(params: {
     if (data.error || !data.streams || data.streams.length === 0) return null;
 
     const embed = data.streams.find((s) => s.embedUrl);
-    const rawUrl = embed?.embedUrl ?? data.streams[0]?.url;
-
-    if (!rawUrl) return null;
-
-    // ✅ Fix: Ensure megaplay.buzz URLs have /videojs/ segment for iframe playback
-    const finalUrl = normalizeMegaplayUrl(rawUrl);
+    const url_ = embed?.embedUrl ?? data.streams[0]?.url;
+    if (!url_) return null;
 
     return {
       server: serverName,
-      url: finalUrl,
+      url: url_,
       source: "anivexa",
     };
   } catch {
@@ -141,25 +130,4 @@ async function fetchOne(params: {
   } finally {
     clearTimeout(timer);
   }
-}
-
-// ============================================================
-// NORMALIZE MEGAPLAY URL
-// https://megaplay.buzz/stream/... → https://megaplay.buzz/videojs/stream/...
-// (Only if /videojs/ segment is missing)
-// ============================================================
-function normalizeMegaplayUrl(url: string): string {
-  if (!url || typeof url !== "string") return url;
-
-  // Only apply to megaplay.buzz hosts
-  if (!url.includes("megaplay.buzz")) return url;
-
-  // Already has /videojs/? Return as-is
-  if (url.includes("megaplay.buzz/videojs/")) return url;
-
-  // Replace "megaplay.buzz/" with "megaplay.buzz/videojs/"
-  return url.replace(
-    /(https?:\/\/megaplay\.buzz)\//,
-    "$1/videojs/"
-  );
 }
