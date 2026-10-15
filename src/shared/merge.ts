@@ -2,21 +2,16 @@ import type { StreamServer } from "./types";
 
 // ============================================================
 // MERGE SERVERS FROM ALL SOURCES
-// Rule: source order (self → anivexa → tatakai)
+// Rule: source order (self → anivexa)
 //       duplicate names get " 2", " 3" suffix
 // ============================================================
 
 export function mergeServers(
   selfServers: StreamServer[],
-  anivexaServers: StreamServer[],
-  tatakaiServers: StreamServer[]
+  anivexaServers: StreamServer[]
 ): StreamServer[] {
   // Concatenate in source order
-  const all: StreamServer[] = [
-    ...selfServers,
-    ...anivexaServers,
-    ...tatakaiServers,
-  ];
+  const all: StreamServer[] = [...selfServers, ...anivexaServers];
 
   // Deduplicate by name (case-insensitive)
   const nameCount = new Map<string, number>();
@@ -41,7 +36,7 @@ export function mergeServers(
 }
 
 // ============================================================
-// MERGE ALL THREE LANGUAGE GROUPS
+// MERGE ALL LANGUAGE GROUPS
 // ============================================================
 
 export interface MergedStreams {
@@ -51,25 +46,19 @@ export interface MergedStreams {
 }
 
 export function mergeAllSources(sources: {
-  self: { eng_sub: StreamServer[]; eng_dub: StreamServer[]; hindi: StreamServer[] };
-  anivexa: { eng_sub: StreamServer[]; eng_dub: StreamServer[] };
-  tatakai: { hindi: StreamServer[] };
+  self: {
+    eng_sub: StreamServer[];
+    eng_dub: StreamServer[];
+    hindi: StreamServer[];
+  };
+  anivexa: {
+    eng_sub: StreamServer[];
+    eng_dub: StreamServer[];
+  };
 }): MergedStreams {
   return {
-    eng_sub: mergeServers(
-      sources.self.eng_sub,
-      sources.anivexa.eng_sub,
-      []
-    ),
-    eng_dub: mergeServers(
-      sources.self.eng_dub,
-      sources.anivexa.eng_dub,
-      []
-    ),
-    hindi: mergeServers(
-      sources.self.hindi,
-      [],
-      sources.tatakai.hindi
-    ),
+    eng_sub: mergeServers(sources.self.eng_sub, sources.anivexa.eng_sub),
+    eng_dub: mergeServers(sources.self.eng_dub, sources.anivexa.eng_dub),
+    hindi: mergeServers(sources.self.hindi, []),
   };
 }
