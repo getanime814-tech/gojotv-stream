@@ -28,22 +28,24 @@ export async function resolveStreams(
     if (cached) return cached;
   }
 
-  // 2. Prepare title fallback chain
-  const titles = [
-    req.english_title,
-    req.romaji_title,
-    req.title,
-  ].filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+  // 2. Prepare title fallbacks
+  const englishTitle = req.english_title?.trim() || req.title?.trim() || "";
+  const romajiTitle = req.romaji_title?.trim() || englishTitle;
+
+  const titles = [englishTitle, romajiTitle, req.title]
+    .filter((t): t is string => typeof t === "string" && t.trim().length > 0);
 
   // 3. Fire all sources in parallel
   const [selfResult, anivexaResult, tatakaiResult] = await Promise.allSettled([
     fetchSelfProxy({
       baseUrl: env.SELF_PROXY_BASE,
       slug: req.slug,
-      title: req.english_title || req.title,
+      englishTitle,
+      romajiTitle,
       season: req.season,
       episode: req.episode,
       anilistId: req.anilist_id,
+      isMovie: req.is_movie,
       timeoutMs: parseInt(env.SELF_PROXY_TIMEOUT_MS, 10),
     }),
     fetchAnivexa({
