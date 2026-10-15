@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 // ============================================================
-// TATAKAI CLIENT — Final Version
+// TATAKAI CLIENT — Final v3
 // ============================================================
 
 interface FetchTatakaiArgs {
@@ -99,7 +99,6 @@ async function fetchHindiDubbed(
   const servers = detail.data?.data?.servers;
   if (!servers) return result;
 
-  // Filemoon + Servabyss
   for (const { key, name } of [
     { key: "filemoon", name: "Filemoon" },
     { key: "servabyss", name: "Servabyss" },
@@ -141,53 +140,81 @@ async function fetchDesiDub(
 
   const animeId = search.slug;
 
-  // Fetch info to get accurate watch slugs
+  // ============================================================
+  // Step 1: Fetch info — get ACTUAL watch slugs
+  // ============================================================
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
   const info = await fetchJson<DesiDubInfoResponse>(infoUrl, timeoutMs);
 
-  let watchSlug = `${animeId}-episode-${episode}`;
+  let watchSlugs: string[] = [];
   let movieDetected = isMovie;
 
-  if (info.ok && info.data?.data?.episodes) {
+  if (info.ok && info.data?.data?.episodes?.length) {
     const eps = info.data.data.episodes;
-    if (eps.length === 0) movieDetected = true;
+
+    // ✅ PRIMARY: Try episode number match
     const matched = eps.find((e) => e.number === episode);
-    if (matched?.id) watchSlug = matched.id;
-  } else if (info.timedOut) {
-    result.timedOut = true;
+    if (matched?.id) {
+      watchSlugs.push(matched.id);
+    }
+
+    // ✅ FALLBACK: Use first episode ID (handles broken numbering)
+    // e.g., JJK S2 has only 1 entry with id "jujutsu-kaisen-2nd-season-episode-47"
+    if (eps[0]?.id && !watchSlugs.includes(eps[0].id)) {
+      watchSlugs.push(eps[0].id);
+    }
+
+    if (eps.length === 0 || (eps.length === 1 && eps[0]?.number === 1)) {
+      movieDetected = true;
+    }
   }
 
-  // Try watch slug
-  let watch = await fetchJson<DesiDubWatchResponse>(
-    `${baseUrl}/api/v1/desidubanime/watch/${watchSlug}`,
-    timeoutMs
-  );
+  // ✅ LAST RESORT: Construct slug
+  const constructedSlug = `${animeId}-episode-${episode}`;
+  if (!watchSlugs.includes(constructedSlug)) {
+    watchSlugs.push(constructedSlug);
+  }
 
-  // Fallback: bare slug (movies)
-  if (
-    (!watch.ok || !watch.data?.data?.sources?.length) &&
-    movieDetected
-  ) {
-    watch = await fetchJson<DesiDubWatchResponse>(
-      `${baseUrl}/api/v1/desidubanime/watch/${animeId}`,
+  // Movie: also try bare slug
+  if (movieDetected && !watchSlugs.includes(animeId)) {
+    watchSlugs.push(animeId);
+  }
+
+  // ============================================================
+  // Step 2: Try each watch slug until we get sources
+  // ============================================================
+  let sources: Array<{ server: string; url: string }> = [];
+
+  for (const slug of watchSlugs) {
+    const watch = await fetchJson<DesiDubWatchResponse>(
+      `${baseUrl}/api/v1/desidubanime/watch/${slug}`,
       timeoutMs
     );
+
+    if (!watch.ok) {
+      if (watch.timedOut) result.timedOut = true;
+      continue;
+    }
+
+    const s = watch.data?.data?.sources;
+    if (Array.isArray(s) && s.length > 0) {
+      sources = s;
+      break; // ✅ Got sources — stop trying
+    }
   }
 
-  if (!watch.ok) {
-    if (watch.timedOut) result.timedOut = true;
-    else result.errored = true;
-    return result;
-  }
+  if (sources.length === 0) return result;
 
-  const sources = watch.data?.data?.sources;
-  if (!Array.isArray(sources) || sources.length === 0) return result;
-
+  // ============================================================
+  // Step 3: Map to StreamServer
+  // ============================================================
   const nameMap: Record<string, string> = {
     Mirrordub: "Mirror",
     Abyssdub: "Abyss",
     VMolydub: "VMoly",
     Streamp2pdub: "Streamp2pdub",
+    PlayerXdub: "PlayerX",
+    Rubydub: "Ruby",
   };
 
   for (const src of sources) {
@@ -203,7 +230,7 @@ async function fetchDesiDub(
 }
 
 // ============================================================
-// PICK SERVER URL — Movie: any, Series: episode match
+// PICK SERVER URL (Hindi Dubbed)
 // ============================================================
 function pickServerUrl(
   list: Array<{ name: string; url: string }>,
@@ -214,8 +241,7 @@ function pickServerUrl(
 
   // Movie OR single entry → take first
   if (isMovie || list.length === 1) {
-    const first = list[0];
-    return first?.url ?? null;
+    return list[0]?.url ?? null;
   }
 
   // Series → match by episode number
@@ -224,7 +250,7 @@ function pickServerUrl(
     if (num === episode && item.url) return item.url;
   }
 
-  // Series fallback: take first (better than nothing)
+  // Fallback: take first (better than nothing)
   return list[0]?.url ?? null;
 }
 
@@ -247,9 +273,8 @@ async function searchHindiDubbed(
     const best = bestTitleMatch(res.data.data.animeList, query);
     if (!best) continue;
 
-    // ✅ Verify: check upstream didn't return wrong anime
     if (!titleMatches(best.title, query) && !isAnyTitleMatch(best.title, queries)) {
-      continue; // Skip wrong match (e.g. "Your Name" → Tokyo Godfathers)
+      continue;
     }
 
     return { slug: best.slug, title: best.title };
@@ -328,23 +353,18 @@ function bestTitleMatch<T extends { title: string }>(
 
   const t = normalize(target);
 
-  // 1. Exact
   const exact = results.find((r) => normalize(r.title) === t);
   if (exact) return exact;
 
-  // 2. Starts with
   const starts = results.find((r) => normalize(r.title).startsWith(t));
   if (starts) return starts;
 
-  // 3. Contains
   const contains = results.find((r) => normalize(r.title).includes(t));
   if (contains) return contains;
 
-  // 4. Reverse contains
   const revContains = results.find((r) => t.includes(normalize(r.title)));
   if (revContains) return revContains;
 
-  // 5. Fallback: first
   return results[0];
 }
 
