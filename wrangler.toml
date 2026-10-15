@@ -13,6 +13,6 @@ binding = "PREFETCH_QUEUE"
 [vars]
 SELF_PROXY_BASE = "https://proxy-api-worker.primebarish385.workers.dev"
 ANIVEXA_BASE = "https://anivexa-api-6arq.onrender.com"
-SELF_PROXY_TIMEOUT_MS = "15000"
+SELF_PROXY_TIMEOUT_MS = "25000"
 ANIVEXA_TIMEOUT_MS = "10000"
 CACHE_TTL_SECONDS = "21600"
