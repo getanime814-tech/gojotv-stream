@@ -8,13 +8,11 @@ import type {
 import { getCached, setCached } from "./redis";
 import { fetchSelfProxy } from "./self-proxy";
 import { fetchAnivexa } from "./anivexa";
-import { fetchTatakai } from "./tatakai";
 import { mergeAllSources } from "./merge";
 
 // ============================================================
-// MAIN RESOLVER — W3 core logic
+// MAIN RESOLVER
 // ============================================================
-
 export async function resolveStreams(
   req: StreamRequest,
   env: Env,
@@ -22,21 +20,16 @@ export async function resolveStreams(
 ): Promise<StreamResponse> {
   const ttl = parseInt(env.CACHE_TTL_SECONDS, 10);
 
-  // 1. Cache check
   if (!options.skipCache) {
     const cached = await getCached(env, req.anilist_id, req.episode);
     if (cached) return cached;
   }
 
-  // 2. Prepare title fallbacks
   const englishTitle = req.english_title?.trim() || req.title?.trim() || "";
   const romajiTitle = req.romaji_title?.trim() || englishTitle;
 
-  const titles = [englishTitle, romajiTitle, req.title]
-    .filter((t): t is string => typeof t === "string" && t.trim().length > 0);
-
-  // 3. Fire all sources in parallel
-  const [selfResult, anivexaResult, tatakaiResult] = await Promise.allSettled([
+  // Fire both sources in parallel
+  const [selfResult, anivexaResult] = await Promise.allSettled([
     fetchSelfProxy({
       baseUrl: env.SELF_PROXY_BASE,
       slug: req.slug,
@@ -54,16 +47,8 @@ export async function resolveStreams(
       episode: req.episode,
       timeoutMs: parseInt(env.ANIVEXA_TIMEOUT_MS, 10),
     }),
-    fetchTatakai({
-      baseUrl: env.TATAKAI_BASE,
-      episode: req.episode,
-      titles,
-      timeoutMs: parseInt(env.TATAKAI_TIMEOUT_MS, 10),
-      isMovie: req.is_movie,
-    }),
   ]);
 
-  // 4. Extract results (safe — handle rejects)
   const self = selfResult.status === "fulfilled"
     ? selfResult.value
     : { eng_sub: [], eng_dub: [], hindi: [], status: "error" as const };
@@ -72,11 +57,6 @@ export async function resolveStreams(
     ? anivexaResult.value
     : { eng_sub: [], eng_dub: [], status: "error" as const };
 
-  const tatakai = tatakaiResult.status === "fulfilled"
-    ? tatakaiResult.value
-    : { hindi: [], status: "error" as const };
-
-  // 5. Merge
   const merged = mergeAllSources({
     self: {
       eng_sub: self.eng_sub,
@@ -87,12 +67,9 @@ export async function resolveStreams(
       eng_sub: anivexa.eng_sub,
       eng_dub: anivexa.eng_dub,
     },
-    tatakai: {
-      hindi: tatakai.hindi,
-    },
+    tatakai: { hindi: [] },
   });
 
-  // 6. Build response
   const response: StreamResponse = {
     anilist_id: req.anilist_id,
     episode: req.episode,
@@ -102,18 +79,15 @@ export async function resolveStreams(
     sources_status: {
       self_proxy: self.status as SourceStatus,
       anivexa: anivexa.status as SourceStatus,
-      tatakai_hindi: tatakai.status as SourceStatus,
-      tatakai_desi: tatakai.status as SourceStatus,
     },
     cached: false,
     resolved_at: new Date().toISOString(),
   };
 
-  // 7. Cache write (only if at least something came back)
-  const totalServers =
+  const total =
     merged.eng_sub.length + merged.eng_dub.length + merged.hindi.length;
 
-  if (totalServers > 0) {
+  if (total > 0) {
     await setCached(env, req.anilist_id, req.episode, response, ttl);
   }
 
@@ -121,14 +95,12 @@ export async function resolveStreams(
 }
 
 // ============================================================
-// PREFETCH — schedule next episode (no delay)
+// PREFETCH
 // ============================================================
-
 export async function schedulePrefetch(
   req: StreamRequest,
   env: Env
 ): Promise<void> {
-  // Skip if last episode
   if (req.total_episodes && req.episode >= req.total_episodes) return;
 
   const nextJob: PrefetchJob = {
