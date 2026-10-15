@@ -57,6 +57,7 @@ export async function resolveStreams(
       episode: req.episode,
       titles,
       timeoutMs: parseInt(env.TATAKAI_TIMEOUT_MS, 10),
+      isMovie: req.is_movie,
     }),
   ]);
 
