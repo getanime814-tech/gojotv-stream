@@ -90,11 +90,19 @@ export async function resolveStreams(
     resolved_at: new Date().toISOString(),
   };
 
-  // 7. Cache write (only if we got at least one server)
+  // 7. Cache write — only if BOTH sources didn't hit timeout
+  // (prevents caching partial results that will never refresh)
   const total =
     merged.eng_sub.length + merged.eng_dub.length + merged.hindi.length;
 
-  if (total > 0) {
+  const selfNotTimeout = self.status !== "timeout";
+  const anivexaNotTimeout = anivexa.status !== "timeout";
+  const hasAnySuccess = self.status === "ok" || anivexa.status === "ok";
+
+  const shouldCache =
+    total > 0 && hasAnySuccess && selfNotTimeout && anivexaNotTimeout;
+
+  if (shouldCache) {
     await setCached(env, req.anilist_id, req.episode, response, ttl);
   }
 
