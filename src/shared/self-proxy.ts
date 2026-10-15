@@ -3,7 +3,9 @@ import type {
   SelfProxyResponse,
 } from "./types";
 
-// ============ SELF-PROXY API CLIENT ============
+// ============================================================
+// SELF-PROXY API CLIENT
+// ============================================================
 
 interface FetchSelfProxyArgs {
   baseUrl: string;
@@ -79,26 +81,33 @@ export async function fetchSelfProxy(
   }
 }
 
+// ============ STRIP PREFIX ============
+// "Anikoto - HD-1" → "HD-1"
+// "ToonStream - FilesForever 1" → "FilesForever 1"
+// If no " - " present → return as-is
+function stripProviderPrefix(name: string): string {
+  const trimmed = name.trim();
+  const idx = trimmed.lastIndexOf(" - ");
+  if (idx === -1) return trimmed;
+  return trimmed.slice(idx + 3).trim();
+}
+
 // ============ MAP SERVERS ============
 function mapSelfProxyServers(
-  servers: SelfProxyResponse["data"] extends { servers: infer S }
-    ? S
-    : never
+  servers: NonNullable<SelfProxyResponse["data"]>["servers"]
 ): SelfProxyResult {
   const eng_sub: StreamServer[] = [];
   const eng_dub: StreamServer[] = [];
   const hindi: StreamServer[] = [];
 
-  for (const s of servers as Array<{
-    server_name: string;
-    type: string;
-    language: string;
-    embed_url: string;
-  }>) {
+  for (const s of servers) {
     if (!s.embed_url || !s.server_name) continue;
 
+    const cleanName = stripProviderPrefix(s.server_name);
+    if (!cleanName) continue;
+
     const mapped: StreamServer = {
-      server: s.server_name.trim(),
+      server: cleanName,
       url: s.embed_url,
       source: "self",
     };
