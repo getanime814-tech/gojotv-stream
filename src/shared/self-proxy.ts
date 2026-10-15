@@ -1,5 +1,5 @@
 // ============================================================
-// SELF-PROXY API CLIENT — v9 (single call, no flood)
+// SELF-PROXY API CLIENT — v10 (single call, no dedup)
 // ============================================================
 
 import type {
@@ -216,7 +216,7 @@ function stripProviderPrefix(name: string): string {
 }
 
 // ============================================================
-// MAP SERVERS — dedup by (name + url)
+// MAP SERVERS — NO DEDUP, keep everything from API
 // ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
@@ -224,7 +224,6 @@ function mapSelfProxyServers(
   const eng_sub: StreamServer[] = [];
   const eng_dub: StreamServer[] = [];
   const hindi: StreamServer[] = [];
-  const seenKeys = new Set<string>();
 
   for (const s of servers) {
     if (!s || typeof s !== "object") continue;
@@ -236,16 +235,13 @@ function mapSelfProxyServers(
     const cleanName = stripProviderPrefix(s.server_name);
     if (!cleanName) continue;
 
-    const key = `${cleanName.toLowerCase()}|${url}`;
-    if (seenKeys.has(key)) continue;
-    seenKeys.add(key);
-
     const mapped: StreamServer = {
       server: cleanName,
       url,
       source: "self",
     };
 
+    // ✅ Group by type/language — NO dedup, ALL servers preserved
     if (s.type === "sub" && s.language === "english") {
       eng_sub.push(mapped);
     } else if (s.type === "dub" && s.language === "english") {
@@ -253,8 +249,10 @@ function mapSelfProxyServers(
     } else if (s.type === "dub" && s.language === "multi-audio") {
       hindi.push(mapped);
     } else if (s.type === "sub") {
+      // Fallback: sub with any other language → eng_sub
       eng_sub.push(mapped);
     } else if (s.type === "dub") {
+      // Fallback: dub with any other language → hindi
       hindi.push(mapped);
     }
   }
