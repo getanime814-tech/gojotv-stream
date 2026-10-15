@@ -7,13 +7,12 @@ import type {
   DesiDubInfoResponse,
 } from "./types";
 
-// ============ TATAKAI API CLIENT ============
-
 interface FetchTatakaiArgs {
   baseUrl: string;
   episode: number;
-  titles: string[]; // fallback chain: [english, romaji, title]
+  titles: string[];
   timeoutMs: number;
+  isMovie?: boolean;
 }
 
 interface TatakaiResult {
@@ -21,15 +20,14 @@ interface TatakaiResult {
   status: "ok" | "empty" | "timeout" | "error";
 }
 
-// ============ MAIN FETCH ============
 export async function fetchTatakai(
   args: FetchTatakaiArgs
 ): Promise<TatakaiResult> {
-  const { baseUrl, episode, titles, timeoutMs } = args;
+  const { baseUrl, episode, titles, timeoutMs, isMovie = false } = args;
 
   const results = await Promise.allSettled([
-    fetchHindiDubbed(baseUrl, episode, titles, timeoutMs),
-    fetchDesiDub(baseUrl, episode, titles, timeoutMs),
+    fetchHindiDubbed(baseUrl, episode, titles, timeoutMs, isMovie),
+    fetchDesiDub(baseUrl, episode, titles, timeoutMs, isMovie),
   ]);
 
   const hindi: StreamServer[] = [];
@@ -64,7 +62,8 @@ async function fetchHindiDubbed(
   baseUrl: string,
   episode: number,
   titles: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  isMovie: boolean
 ): Promise<{
   servers: StreamServer[];
   timedOut: boolean;
@@ -74,7 +73,6 @@ async function fetchHindiDubbed(
   let timedOut = false;
   let errored = false;
 
-  // 1. Search (try titles in order)
   const found = await searchWithFallback(
     baseUrl,
     titles,
@@ -84,7 +82,6 @@ async function fetchHindiDubbed(
 
   if (!found) return { servers, timedOut: false, errored: false };
 
-  // 2. Fetch anime details
   const animeUrl = `${baseUrl}/api/v1/hindidubbed/anime/${found.slug}`;
   const data = await fetchJsonWithTimeout<HindiDubbedAnimeResponse>(
     animeUrl,
@@ -100,7 +97,6 @@ async function fetchHindiDubbed(
   const serversData = data.data?.data?.servers;
   if (!serversData) return { servers, timedOut, errored };
 
-  // 3. Map Filemoon + Servabyss
   const mappings: Array<{ key: "filemoon" | "servabyss"; name: string }> = [
     { key: "filemoon", name: "Filemoon" },
     { key: "servabyss", name: "Servabyss" },
@@ -108,18 +104,28 @@ async function fetchHindiDubbed(
 
   for (const { key, name } of mappings) {
     const list = serversData[key];
-    if (!Array.isArray(list)) continue;
+    if (!Array.isArray(list) || list.length === 0) continue;
 
-    // Find episode by number in "name" field
+    // ✅ Movie OR single-entry list → take all
+    // ✅ Series with multiple entries → match episode number
+    const useAll = isMovie || list.length === 1;
+
     for (const item of list) {
-      const num = parseEpisodeNumber(item.name);
-      if (num !== episode) continue;
+      if (!item.url) continue;
+
+      if (!useAll) {
+        const num = parseEpisodeNumber(item.name);
+        if (num !== episode) continue;
+      }
 
       servers.push({
         server: name,
         url: item.url,
         source: "tatakai-hindi",
       });
+
+      // Series: only take first matching entry
+      if (!useAll) break;
     }
   }
 
@@ -133,7 +139,8 @@ async function fetchDesiDub(
   baseUrl: string,
   episode: number,
   titles: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  isMovie: boolean
 ): Promise<{
   servers: StreamServer[];
   timedOut: boolean;
@@ -143,7 +150,6 @@ async function fetchDesiDub(
   let timedOut = false;
   let errored = false;
 
-  // 1. Search
   const found = await searchWithFallback(
     baseUrl,
     titles,
@@ -154,9 +160,8 @@ async function fetchDesiDub(
 
   if (!found) return { servers, timedOut, errored };
 
-  const animeId = found.slug; // desi uses `id` as slug
+  const animeId = found.slug;
 
-  // 2. Fetch anime info to get episode watch slugs
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
   const infoData = await fetchJsonWithTimeout<DesiDubInfoResponse>(
     infoUrl,
@@ -164,11 +169,11 @@ async function fetchDesiDub(
   );
 
   let watchSlug = `${animeId}-episode-${episode}`;
-  let isMovie = false;
+  let isMovieDetected = isMovie;
 
   if (infoData.ok && infoData.data?.data?.episodes) {
     const eps = infoData.data.data.episodes;
-    if (eps.length === 0) isMovie = true;
+    if (eps.length === 0) isMovieDetected = true;
     const matched = eps.find((e) => e.number === episode);
     if (matched) watchSlug = matched.id;
   } else {
@@ -176,16 +181,15 @@ async function fetchDesiDub(
     else errored = true;
   }
 
-  // 3. Fetch watch sources
   let watchData = await fetchJsonWithTimeout<DesiDubWatchResponse>(
     `${baseUrl}/api/v1/desidubanime/watch/${watchSlug}`,
     timeoutMs
   );
 
-  // Movie fallback: try bare slug
+  // Movie fallback: try bare slug (no -episode-N)
   if (
     (!watchData.ok || !watchData.data?.data?.sources?.length) &&
-    isMovie
+    isMovieDetected
   ) {
     watchData = await fetchJsonWithTimeout<DesiDubWatchResponse>(
       `${baseUrl}/api/v1/desidubanime/watch/${animeId}`,
@@ -197,7 +201,6 @@ async function fetchDesiDub(
     return { servers, timedOut, errored };
   }
 
-  // 4. Map sources → rename
   const nameMap: Record<string, string> = {
     Mirrordub: "Mirror",
     Abyssdub: "Abyss",
@@ -266,9 +269,7 @@ async function searchWithFallback(
   );
 
   for (const title of cleanedTitles) {
-    const url = isDesi
-      ? `${endpointPrefix}${encodeURIComponent(title)}`
-      : `${endpointPrefix}${encodeURIComponent(title)}`;
+    const url = `${endpointPrefix}${encodeURIComponent(title)}`;
 
     if (isDesi) {
       const res = await fetchJsonWithTimeout<DesiDubSearchResponse>(
@@ -309,19 +310,15 @@ function bestTitleMatch<T extends { title: string }>(
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   const t = norm(target);
 
-  // 1. Exact
   const exact = results.find((r) => norm(r.title) === t);
   if (exact) return exact;
 
-  // 2. Starts with
   const starts = results.find((r) => norm(r.title).startsWith(t));
   if (starts) return starts;
 
-  // 3. Contains
   const contains = results.find((r) => norm(r.title).includes(t));
   if (contains) return contains;
 
-  // 4. Fallback: first result
   return results[0];
 }
 
