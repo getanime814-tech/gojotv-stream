@@ -1,6 +1,9 @@
 import type { StreamServer, AnivexaWatchResponse } from "./types";
 
-// ============ ANIVEXA API CLIENT ============
+// ============================================================
+// ANIVEXA API CLIENT
+// Provider names hidden — mapped to neutral display names
+// ============================================================
 
 interface FetchAnivexaArgs {
   baseUrl: string;
@@ -15,12 +18,13 @@ interface AnivexaResult {
   status: "ok" | "empty" | "timeout" | "error";
 }
 
+// ✅ Neutral display names (no provider branding)
 const PROVIDERS: Array<{
   provider: string;
   serverName: string;
 }> = [
-  { provider: "anikoto", serverName: "Anikoto" },
-  { provider: "animegg", serverName: "Animegg" },
+  { provider: "anikoto", serverName: "MG play" },
+  { provider: "animegg", serverName: "GG play" },
 ];
 
 // ============ MAIN FETCH (parallel) ============
@@ -64,14 +68,12 @@ export async function fetchAnivexa(
   const eng_dub: StreamServer[] = [];
   let hasTimeout = false;
   let hasError = false;
-  let anySuccess = false;
 
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
-    const isDub = i % 2 === 1; // odd index = dub
+    const isDub = i % 2 === 1;
 
     if (r.status === "fulfilled" && r.value) {
-      anySuccess = true;
       if (isDub) eng_dub.push(r.value);
       else eng_sub.push(r.value);
     } else if (r.status === "rejected") {
@@ -123,7 +125,6 @@ async function fetchOne(params: {
     const data = (await res.json()) as AnivexaWatchResponse;
     if (data.error || !data.streams || data.streams.length === 0) return null;
 
-    // Priority: embed type with embedUrl
     const embed = data.streams.find((s) => s.embedUrl);
     const url_ = embed?.embedUrl ?? data.streams[0]?.url;
 
