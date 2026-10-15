@@ -1,0 +1,22 @@
+name = "gojotv-stream"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Prefetch queue producer (W3 → W9)
+[[queues.producers]]
+queue = "prefetch-queue"
+binding = "PREFETCH_QUEUE"
+
+# Environment variables
+[vars]
+SELF_PROXY_BASE = "https://proxy-api-worker.primebarish385.workers.dev"
+ANIVEXA_BASE = "https://anivexa-api-6arq.onrender.com"
+TATAKAI_BASE = "https://tatakai-api-2qqx.onrender.com"
+SELF_PROXY_TIMEOUT_MS = "20000"
+ANIVEXA_TIMEOUT_MS = "10000"
+TATAKAI_TIMEOUT_MS = "15000"
+CACHE_TTL_SECONDS = "21600"
