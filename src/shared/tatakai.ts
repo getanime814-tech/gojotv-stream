@@ -8,8 +8,8 @@ import type {
 } from "./types";
 
 // ============================================================
-// TATAKAI CLIENT — Final v7
-// Handles both hindi dubbed + desi dub with max accuracy
+// TATAKAI CLIENT — Final v8
+// Distinctive-token matching prevents wrong-anime matches
 // ============================================================
 
 interface FetchTatakaiArgs {
@@ -70,7 +70,7 @@ export async function fetchTatakai(
 }
 
 // ============================================================
-// HINDI DUBBED (animehindidubbed)
+// HINDI DUBBED
 // ============================================================
 async function fetchHindiDubbed(
   baseUrl: string,
@@ -128,7 +128,7 @@ async function fetchHindiDubbed(
 }
 
 // ============================================================
-// DESI DUB (desidubanime) — prefix-aware + iframe-safe
+// DESI DUB (prefix-aware)
 // ============================================================
 async function fetchDesiDub(
   baseUrl: string,
@@ -148,9 +148,6 @@ async function fetchDesiDub(
 
   const animeId = search.slug;
 
-  // ============================================================
-  // Fetch info — extract real episode prefix
-  // ============================================================
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
   const info = await fetchJsonWithRetry<DesiDubInfoResponse>(
     infoUrl,
@@ -160,8 +157,6 @@ async function fetchDesiDub(
 
   const infoEpisodes = info.ok ? info.data?.data?.episodes : undefined;
 
-  // Extract real prefix from first info entry
-  // e.g., "kimetsu-no-yaiba-episode-26" → "kimetsu-no-yaiba"
   let realPrefix = animeId;
   if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
     const firstId = infoEpisodes[0]?.id;
@@ -181,10 +176,8 @@ async function fetchDesiDub(
 
   const movieDetected = isMovie;
 
-  // PRIORITY 1: Real prefix + episode N (most accurate)
   addSlug(`${realPrefix}-episode-${episode}`);
 
-  // PRIORITY 2: Info number-match
   if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
     const byNumber = infoEpisodes.find((e) => e.number === episode);
     if (byNumber?.id) addSlug(byNumber.id);
@@ -192,7 +185,6 @@ async function fetchDesiDub(
     result.timedOut = true;
   }
 
-  // PRIORITY 3: Info index-match
   if (
     Array.isArray(infoEpisodes) &&
     episode > 0 &&
@@ -202,19 +194,14 @@ async function fetchDesiDub(
     if (byIndex?.id) addSlug(byIndex.id);
   }
 
-  // PRIORITY 4: Search slug fallback
   addSlug(`${animeId}-episode-${episode}`);
   addSlug(`${animeId}-${episode}`);
 
-  // PRIORITY 5: Movie bare slug
   if (movieDetected) {
     addSlug(animeId);
     addSlug(realPrefix);
   }
 
-  // ============================================================
-  // Try each candidate
-  // ============================================================
   let sources: Array<{ server: string; url: string }> = [];
 
   for (const slug of candidates) {
@@ -237,9 +224,6 @@ async function fetchDesiDub(
 
   if (sources.length === 0) return result;
 
-  // ============================================================
-  // Map to StreamServer (with iframe extraction)
-  // ============================================================
   const nameMap: Record<string, string> = {
     Mirrordub: "Mirror",
     Abyssdub: "Abyss",
@@ -251,7 +235,6 @@ async function fetchDesiDub(
 
   for (const src of sources) {
     if (!src.url) continue;
-
     const cleanUrl = extractUrl(src.url);
     if (!cleanUrl) continue;
 
@@ -266,13 +249,12 @@ async function fetchDesiDub(
 }
 
 // ============================================================
-// EXTRACT CLEAN URL — handles iframe HTML + protocol-relative
+// EXTRACT CLEAN URL
 // ============================================================
 function extractUrl(input: string): string | null {
   if (!input || typeof input !== "string") return null;
   const trimmed = input.trim();
 
-  // Iframe HTML: <iframe src="..." /> or <iframe src='...' />
   const iframeMatch = trimmed.match(/<iframe[^>]*\ssrc=["']([^"']+)["']/i);
   if (iframeMatch?.[1]) {
     let url = iframeMatch[1].trim();
@@ -280,7 +262,6 @@ function extractUrl(input: string): string | null {
     return url;
   }
 
-  // Plain URL
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
     return trimmed;
   }
@@ -364,7 +345,7 @@ async function searchDesiDub(
 }
 
 // ============================================================
-// TITLE VARIANT GENERATOR (10-12 variants per title)
+// TITLE VARIANT GENERATOR
 // ============================================================
 function generateTitleVariants(titles: string[]): string[] {
   const seen = new Set<string>();
@@ -405,23 +386,17 @@ function generateTitleVariants(titles: string[]): string[] {
 }
 
 // ============================================================
-// HELPERS
+// STOPWORDS — common series words that aren't distinctive
 // ============================================================
-function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, "").trim();
-}
+const STOPWORDS = new Set([
+  "the", "a", "an", "of", "and", "or", "to", "in", "on", "at",
+  "demon", "slayer", "kimetsu", "yaiba", "no", "wa", "ga", "wo",
+  "season", "part", "cour", "arc", "tv", "series", "movie", "film",
+]);
 
-function titleMatches(returned: string, target: string): boolean {
-  const a = normalize(returned);
-  const b = normalize(target);
-  if (!a || !b) return false;
-  return a === b || a.startsWith(b) || b.startsWith(a);
-}
-
-function isAnyTitleMatch(returned: string, titles: string[]): boolean {
-  return titles.some((t) => titleMatches(returned, t));
-}
-
+// ============================================================
+// TITLE MATCHING — distinctive tokens only
+// ============================================================
 function bestTitleMatch<T extends { title: string }>(
   results: T[],
   target: string,
@@ -431,24 +406,72 @@ function bestTitleMatch<T extends { title: string }>(
 
   const t = normalize(target);
 
+  // 1. Exact normalized match
   const exact = results.find((r) => normalize(r.title) === t);
   if (exact) return exact;
 
-  const starts = results.find((r) => normalize(r.title).startsWith(t));
-  if (starts) return starts;
+  // 2. Token-based distinctive matching (main filter)
+  return distinctiveMatch(results, target, originalTitles);
+}
 
-  const contains = results.find((r) => normalize(r.title).includes(t));
-  if (contains) return contains;
+// ============================================================
+// DISTINCTIVE MATCH — rejects partial matches (movie vs series)
+// ============================================================
+function distinctiveMatch<T extends { title: string }>(
+  results: T[],
+  target: string,
+  originalTitles: string[]
+): T | null {
+  // Collect distinctive tokens from all original titles + target
+  const queryTokens = new Set<string>();
+  for (const orig of [...originalTitles, target]) {
+    if (!orig) continue;
+    normalize(orig)
+      .split(/[\s\-_]+/)
+      .filter((tk) => tk.length > 2 && !STOPWORDS.has(tk))
+      .forEach((tk) => queryTokens.add(tk));
+  }
 
-  const revContains = results.find((r) => t.includes(normalize(r.title)));
-  if (revContains) return revContains;
+  // If query has no distinctive tokens (short generic title),
+  // fall back to first result (best-effort)
+  if (queryTokens.size === 0) {
+    return results[0];
+  }
 
-  const validMatch = results.find((r) =>
-    isAnyTitleMatch(r.title, originalTitles)
-  );
-  if (validMatch) return validMatch;
+  // Score each result by distinctive token overlap
+  const scored = results.map((r) => {
+    const rTokens = new Set(
+      normalize(r.title)
+        .split(/[\s\-_]+/)
+        .filter((tk) => tk.length > 2 && !STOPWORDS.has(tk))
+    );
 
-  return results[0];
+    let matched = 0;
+    for (const qt of queryTokens) {
+      if (rTokens.has(qt)) matched++;
+    }
+
+    return {
+      result: r,
+      matched,
+      ratio: matched / queryTokens.size,
+    };
+  });
+
+  scored.sort((a, b) => b.ratio - a.ratio);
+
+  const best = scored[0];
+  // Require at least 30% distinctive token overlap
+  if (!best || best.ratio < 0.3) return null;
+
+  return best.result;
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function normalize(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "").trim();
 }
 
 function parseEpisodeNumber(name: string): number | null {
@@ -512,4 +535,4 @@ async function fetchJsonWithRetry<T>(
   }
 
   return lastResult;
-}
+  }
