@@ -1,5 +1,5 @@
 // ============================================================
-// SELF-PROXY API CLIENT — v8 (parallel slugs, Cloudy last)
+// SELF-PROXY API CLIENT — v9 (single call, no flood)
 // ============================================================
 
 import type {
@@ -17,7 +17,6 @@ interface FetchSelfProxyArgs {
   anilistId: number;
   isMovie: boolean;
   timeoutMs: number;
-  debug?: boolean;
 }
 
 interface SelfProxyResult {
@@ -38,11 +37,11 @@ interface AttemptArgs {
   timeoutMs: number;
 }
 
-// ✅ Servers that go to the END of their list (less reliable)
+// ✅ Servers pushed to the END of their list (less reliable)
 const LOW_PRIORITY_SERVERS = new Set(["cloudy"]);
 
 // ============================================================
-// MAIN FETCH — parallel slug attempts
+// MAIN FETCH — single call, no parallel flood
 // ============================================================
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
@@ -76,59 +75,36 @@ export async function fetchSelfProxy(
   const safeEnglish = rawEnglish || rawRomaji || slugAsTitle;
   const safeRomaji = rawRomaji || rawEnglish || slugAsTitle;
 
-  const candidates = dedupeStrings([
-    (slug || "").trim(),
-    generateSlug(rawEnglish),
-    generateSlug(rawRomaji),
-  ]);
+  // ✅ SINGLE slug — self-proxy handles title fallback internally
+  // Priority: English-generated → provided slug → Romaji-generated
+  const primarySlug =
+    generateSlug(rawEnglish) ||
+    (slug || "").trim() ||
+    generateSlug(rawRomaji);
 
-  if (candidates.length === 0) return emptyResult("empty");
+  if (!primarySlug) return emptyResult("empty");
 
-  // ✅ Fire ALL slug attempts in PARALLEL (not sequential)
-  const attemptPromises = candidates.map((trySlug) =>
-    attemptFetch({
-      baseUrl: cleanBaseUrl,
-      slug: trySlug,
-      titleEnglish: safeEnglish,
-      titleRomaji: safeRomaji,
-      season: finalSeason,
-      episode: finalEpisode,
-      anilistId,
-      timeoutMs,
-    })
-  );
+  const result = await attemptFetch({
+    baseUrl: cleanBaseUrl,
+    slug: primarySlug,
+    titleEnglish: safeEnglish,
+    titleRomaji: safeRomaji,
+    season: finalSeason,
+    episode: finalEpisode,
+    anilistId,
+    timeoutMs,
+  });
 
-  const results = await Promise.all(attemptPromises);
+  // Reorder: Cloudy last
+  result.eng_sub = reorderLowPriority(result.eng_sub);
+  result.eng_dub = reorderLowPriority(result.eng_dub);
+  result.hindi = reorderLowPriority(result.hindi);
 
-  // Merge all results
-  const aggregated: SelfProxyResult = emptyResult("empty");
-  const seenKeys = new Set<string>();
-  let hasTimeout = false;
-  let hasError = false;
-  let hasAny = false;
-
-  for (const result of results) {
-    mergeInto(aggregated, result, seenKeys);
-    if (result.status === "ok") hasAny = true;
-    if (result.status === "timeout") hasTimeout = true;
-    if (result.status === "error") hasError = true;
-  }
-
-  if (hasAny) aggregated.status = "ok";
-  else if (hasTimeout) aggregated.status = "timeout";
-  else if (hasError) aggregated.status = "error";
-  else aggregated.status = "empty";
-
-  // ✅ Reorder: Cloudy last
-  aggregated.eng_sub = reorderLowPriority(aggregated.eng_sub);
-  aggregated.eng_dub = reorderLowPriority(aggregated.eng_dub);
-  aggregated.hindi = reorderLowPriority(aggregated.hindi);
-
-  return aggregated;
+  return result;
 }
 
 // ============================================================
-// REORDER — Low priority servers to the end (stable)
+// REORDER — Low-priority servers to the end (stable)
 // ============================================================
 function reorderLowPriority(list: StreamServer[]): StreamServer[] {
   const normal: StreamServer[] = [];
@@ -144,28 +120,6 @@ function reorderLowPriority(list: StreamServer[]): StreamServer[] {
   }
 
   return [...normal, ...low];
-}
-
-// ============================================================
-// MERGE — dedup by (name + url)
-// ============================================================
-function mergeInto(
-  target: SelfProxyResult,
-  src: SelfProxyResult,
-  seenKeys: Set<string>
-): void {
-  const add = (list: StreamServer[], dest: StreamServer[]) => {
-    for (const s of list) {
-      if (!s.url || !s.server) continue;
-      const key = `${s.server.toLowerCase()}|${s.url}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-      dest.push(s);
-    }
-  };
-  add(src.eng_sub, target.eng_sub);
-  add(src.eng_dub, target.eng_dub);
-  add(src.hindi, target.hindi);
 }
 
 // ============================================================
@@ -247,19 +201,6 @@ function generateSlug(title: string): string {
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
-}
-
-function dedupeStrings(arr: Array<string | undefined | null>): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of arr) {
-    if (!item || typeof item !== "string") continue;
-    const trimmed = item.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    out.push(trimmed);
-  }
-  return out;
 }
 
 function emptyResult(status: SelfProxyResult["status"]): SelfProxyResult {
