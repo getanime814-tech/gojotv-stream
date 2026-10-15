@@ -8,15 +8,7 @@ import type {
 } from "./types";
 
 // ============================================================
-// TATAKAI CLIENT — Final v5 (95-99% accuracy target)
-//
-// Priority rules:
-//   1. Info endpoint number-match (most accurate)
-//   2. Constructed slug {animeId}-episode-{N} (user's pattern)
-//   3. Info index-match (episode-1 position)
-//   4. Other constructed patterns
-//   5. Info first-entry (LAST RESORT — avoids wrong episodes)
-//   6. Movie bare slug (only if isMovie)
+// TATAKAI CLIENT — Final v6 (safe priority, no wrong episodes)
 // ============================================================
 
 interface FetchTatakaiArgs {
@@ -118,7 +110,6 @@ async function fetchHindiDubbed(
     const list = servers[key];
     if (!Array.isArray(list) || list.length === 0) continue;
 
-    // ✅ SAFE PRIORITY: number-match first, then single-entry/movie
     const url = pickHindiServerUrl(list, episode, isMovie);
     if (!url) continue;
 
@@ -133,7 +124,7 @@ async function fetchHindiDubbed(
 }
 
 // ============================================================
-// DESI DUB (desidubanime) — SAFE PRIORITY ORDER
+// DESI DUB — SAFE PRIORITY (v6 fix)
 // ============================================================
 async function fetchDesiDub(
   baseUrl: string,
@@ -154,7 +145,7 @@ async function fetchDesiDub(
   const animeId = search.slug;
 
   // ============================================================
-  // Step 1: Fetch info (to get actual episode IDs)
+  // Fetch info
   // ============================================================
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
   const info = await fetchJsonWithRetry<DesiDubInfoResponse>(
@@ -163,7 +154,6 @@ async function fetchDesiDub(
     1
   );
 
-  // Build slug candidates in SAFE PRIORITY order
   const candidates: string[] = [];
   const addSlug = (s: string | undefined | null) => {
     if (!s || typeof s !== "string") return;
@@ -172,26 +162,21 @@ async function fetchDesiDub(
     candidates.push(trimmed);
   };
 
-  let movieDetected = isMovie;
   const infoEpisodes = info.ok ? info.data?.data?.episodes : undefined;
 
-  // ✅ PRIORITY 1: Info number-match
+  // ✅ Rule 2 (v6): Trust is_movie from W6 only
+  // "Full Movie" title alone is NOT enough — DesiDub often mislabels
+  const movieDetected = isMovie;
+
+  // ✅ PRIORITY 1: Info number-match (accurate)
   if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
     const byNumber = infoEpisodes.find((e) => e.number === episode);
     if (byNumber?.id) addSlug(byNumber.id);
-
-    // Detect movie: single entry with "Movie"/"Full" in title
-    if (
-      infoEpisodes.length === 1 &&
-      /movie|full/i.test(infoEpisodes[0]?.title ?? "")
-    ) {
-      movieDetected = true;
-    }
   } else if (info.timedOut) {
     result.timedOut = true;
   }
 
-  // ✅ PRIORITY 2: Constructed slug (user's actual pattern)
+  // ✅ PRIORITY 2: Constructed slug (user's pattern)
   addSlug(`${animeId}-episode-${episode}`);
 
   // ✅ PRIORITY 3: Info index-match (episode-1 position)
@@ -209,22 +194,29 @@ async function fetchDesiDub(
   addSlug(`${animeId}-ep-${episode}`);
   addSlug(`${animeId}-episode-${episode}-english`);
 
-  // ✅ PRIORITY 5: Info first-entry (LAST RESORT — wrong episode risk)
-  if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
-    // Only add if episode count suggests single-episode content
-    // OR if constructed patterns matched nothing (we'll try in order anyway)
-    if (infoEpisodes.length === 1 || isMovie) {
-      addSlug(infoEpisodes[0]?.id);
+  // ✅ PRIORITY 5 (v6 RULE 1): Info first-entry ONLY if number matches
+  // ──────────────────────────────────────────────────────────
+  // The v5 bug: S1E8 request served S1E26 due to info first-entry fallback
+  // The v6 fix: only use info first-entry if it's truly the same episode
+  // ──────────────────────────────────────────────────────────
+  if (Array.isArray(infoEpisodes) && infoEpisodes.length === 1) {
+    const onlyEp = infoEpisodes[0];
+    const numberMatches = onlyEp?.number === episode;
+    const isEpisode1 = episode === 1;
+
+    if ((numberMatches || isEpisode1) && onlyEp?.id) {
+      addSlug(onlyEp.id);
     }
+    // Otherwise SKIP — do not serve wrong episode
   }
 
-  // ✅ PRIORITY 6: Movie bare slug
+  // ✅ PRIORITY 6: Movie bare slug (only if isMovie from W6)
   if (movieDetected) {
     addSlug(animeId);
   }
 
   // ============================================================
-  // Step 2: Try each candidate in order
+  // Try each candidate in SAFE ORDER
   // ============================================================
   let sources: Array<{ server: string; url: string }> = [];
 
@@ -249,7 +241,7 @@ async function fetchDesiDub(
   if (sources.length === 0) return result;
 
   // ============================================================
-  // Step 3: Map to StreamServer
+  // Map to StreamServer
   // ============================================================
   const nameMap: Record<string, string> = {
     Mirrordub: "Mirror",
@@ -274,8 +266,6 @@ async function fetchDesiDub(
 
 // ============================================================
 // PICK HINDI SERVER URL
-// Movie or single-entry → first URL
-// Series → match by episode number, fallback first
 // ============================================================
 function pickHindiServerUrl(
   list: Array<{ name: string; url: string }>,
@@ -284,18 +274,15 @@ function pickHindiServerUrl(
 ): string | null {
   if (!Array.isArray(list) || list.length === 0) return null;
 
-  // Movie OR single entry → take first
   if (isMovie || list.length === 1) {
     return list[0]?.url ?? null;
   }
 
-  // Series → number match
   for (const item of list) {
     const num = parseEpisodeNumber(item.name);
     if (num === episode && item.url) return item.url;
   }
 
-  // Fallback: first (better than empty)
   return list[0]?.url ?? null;
 }
 
@@ -350,7 +337,7 @@ async function searchDesiDub(
 }
 
 // ============================================================
-// TITLE VARIANT GENERATOR (10+ per title)
+// TITLE VARIANT GENERATOR
 // ============================================================
 function generateTitleVariants(titles: string[]): string[] {
   const seen = new Set<string>();
@@ -371,32 +358,20 @@ function generateTitleVariants(titles: string[]): string[] {
 
     push(t);
 
-    // Strip "Season 2", "Part 1", "Cour 2"
     push(t.replace(/\s+(season|part|cour)\s*\d+/gi, " ").trim());
-
-    // Strip "2nd Season", "3rd Season"
     push(t.replace(/\s+\d+(?:st|nd|rd|th)\s+season/gi, " ").trim());
-
-    // Strip "Final Season"
     push(t.replace(/\s+final\s+season/gi, " ").trim());
-
-    // Strip parentheses/brackets
     push(t.replace(/[\(\[].*?[\)\]]/g, " ").trim());
 
-    // Strip after colon / before colon
     if (t.includes(":")) {
       push(t.split(":")[0]?.trim());
       push(t.split(":").pop()?.trim());
     }
 
-    // Strip symbols
     push(t.replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim());
 
-    // First 3 words
     const words = t.split(/\s+/).filter(Boolean);
     if (words.length > 3) push(words.slice(0, 3).join(" "));
-
-    // First 2 words (extra fallback)
     if (words.length > 2) push(words.slice(0, 2).join(" "));
   }
 
@@ -430,29 +405,23 @@ function bestTitleMatch<T extends { title: string }>(
 
   const t = normalize(target);
 
-  // 1. Exact match
   const exact = results.find((r) => normalize(r.title) === t);
   if (exact) return exact;
 
-  // 2. Starts with
   const starts = results.find((r) => normalize(r.title).startsWith(t));
   if (starts) return starts;
 
-  // 3. Contains target
   const contains = results.find((r) => normalize(r.title).includes(t));
   if (contains) return contains;
 
-  // 4. Reverse contains (target contains result)
   const revContains = results.find((r) => t.includes(normalize(r.title)));
   if (revContains) return revContains;
 
-  // 5. Match against ORIGINAL titles (validates wrong-anime bug)
   const validMatch = results.find((r) =>
     isAnyTitleMatch(r.title, originalTitles)
   );
   if (validMatch) return validMatch;
 
-  // 6. Fallback: first result (still return, don't reject)
   return results[0];
 }
 
