@@ -1,5 +1,5 @@
 // ============================================================
-// SELF-PROXY API CLIENT — v6 (dedup by name+url)
+// SELF-PROXY API CLIENT — v7 (Cloudy last, fast)
 // ============================================================
 
 import type {
@@ -36,8 +36,10 @@ interface AttemptArgs {
   episode: number;
   anilistId: number;
   timeoutMs: number;
-  debug?: boolean;
 }
+
+// ✅ Servers that go to the END of their list (less reliable)
+const LOW_PRIORITY_SERVERS = new Set(["cloudy"]);
 
 // ============================================================
 // MAIN FETCH
@@ -55,7 +57,6 @@ export async function fetchSelfProxy(
     anilistId,
     isMovie,
     timeoutMs,
-    debug = false,
   } = args;
 
   if (!baseUrl || typeof baseUrl !== "string") {
@@ -63,9 +64,7 @@ export async function fetchSelfProxy(
   }
 
   const cleanBaseUrl = baseUrl.replace(/\/+$/, "").trim();
-  if (!cleanBaseUrl.startsWith("http")) {
-    return emptyResult("error");
-  }
+  if (!cleanBaseUrl.startsWith("http")) return emptyResult("error");
 
   const finalSeason = isMovie ? 1 : Math.max(1, season || 1);
   const finalEpisode = isMovie ? 1 : Math.max(1, episode || 1);
@@ -103,7 +102,6 @@ export async function fetchSelfProxy(
       episode: finalEpisode,
       anilistId,
       timeoutMs,
-      debug,
     });
 
     mergeInto(aggregated, result, seenKeys);
@@ -118,7 +116,31 @@ export async function fetchSelfProxy(
   else if (hasError) aggregated.status = "error";
   else aggregated.status = "empty";
 
+  // ✅ Move cloudy (and other low-priority) servers to the end
+  aggregated.eng_sub = reorderLowPriority(aggregated.eng_sub);
+  aggregated.eng_dub = reorderLowPriority(aggregated.eng_dub);
+  aggregated.hindi = reorderLowPriority(aggregated.hindi);
+
   return aggregated;
+}
+
+// ============================================================
+// REORDER — Low priority servers to the end (stable)
+// ============================================================
+function reorderLowPriority(list: StreamServer[]): StreamServer[] {
+  const normal: StreamServer[] = [];
+  const low: StreamServer[] = [];
+
+  for (const s of list) {
+    const name = s.server.toLowerCase().trim();
+    if (LOW_PRIORITY_SERVERS.has(name)) {
+      low.push(s);
+    } else {
+      normal.push(s);
+    }
+  }
+
+  return [...normal, ...low];
 }
 
 // ============================================================
@@ -163,15 +185,9 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
   params.set("season", String(season));
   params.set("episode", String(episode));
 
-  if (titleEnglish && titleEnglish.trim().length > 0) {
-    params.set("title_english", titleEnglish.trim());
-  }
-  if (titleRomaji && titleRomaji.trim().length > 0) {
-    params.set("title_romaji", titleRomaji.trim());
-  }
-  if (anilistId && anilistId > 0) {
-    params.set("anilist_id", String(anilistId));
-  }
+  if (titleEnglish) params.set("title_english", titleEnglish);
+  if (titleRomaji) params.set("title_romaji", titleRomaji);
+  if (anilistId > 0) params.set("anilist_id", String(anilistId));
 
   const url = `${baseUrl}/api/streaming?${params.toString()}`;
 
@@ -216,7 +232,7 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
 }
 
 // ============================================================
-// SLUG GENERATION
+// HELPERS
 // ============================================================
 function generateSlug(title: string): string {
   if (!title || typeof title !== "string") return "";
@@ -256,7 +272,7 @@ function stripProviderPrefix(name: string): string {
 }
 
 // ============================================================
-// MAP SERVERS — dedup by (name + url)
+// MAP SERVERS
 // ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
@@ -264,7 +280,6 @@ function mapSelfProxyServers(
   const eng_sub: StreamServer[] = [];
   const eng_dub: StreamServer[] = [];
   const hindi: StreamServer[] = [];
-
   const seenKeys = new Set<string>();
 
   for (const s of servers) {
@@ -277,7 +292,6 @@ function mapSelfProxyServers(
     const cleanName = stripProviderPrefix(s.server_name);
     if (!cleanName) continue;
 
-    // ✅ Dedup by (name + url) — allows same URL under different names
     const key = `${cleanName.toLowerCase()}|${url}`;
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
