@@ -4,16 +4,18 @@ import type {
 } from "./types";
 
 // ============================================================
-// SELF-PROXY API CLIENT
+// SELF-PROXY API CLIENT (Spec v5.2 compliant)
 // ============================================================
 
 interface FetchSelfProxyArgs {
   baseUrl: string;
   slug: string;
-  title: string;
+  englishTitle: string;
+  romajiTitle: string;
   season: number;
   episode: number;
   anilistId: number;
+  isMovie: boolean;
   timeoutMs: number;
 }
 
@@ -28,13 +30,36 @@ interface SelfProxyResult {
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
 ): Promise<SelfProxyResult> {
-  const { baseUrl, slug, title, season, episode, anilistId, timeoutMs } = args;
+  const {
+    baseUrl,
+    slug,
+    englishTitle,
+    romajiTitle,
+    season,
+    episode,
+    anilistId,
+    isMovie,
+    timeoutMs,
+  } = args;
+
+  // Spec Rule 3 & 7: Movies must be season=1, episode=1
+  const finalSeason = isMovie ? 1 : season;
+  const finalEpisode = isMovie ? 1 : episode;
+
+  // Spec Rule 1: Send both titles separately
+  // Fallback: if one missing, use the other
+  const safeEnglish = englishTitle?.trim() || romajiTitle?.trim() || "";
+  const safeRomaji = romajiTitle?.trim() || englishTitle?.trim() || "";
+
+  // Spec Rule 2 & 4: slug required, URL-encoded
+  const safeSlug = slug?.trim() || generateSlug(safeEnglish);
 
   const params = new URLSearchParams({
-    slug,
-    title,
-    season: String(season),
-    episode: String(episode),
+    slug: safeSlug,
+    title_romaji: safeRomaji,
+    title_english: safeEnglish,
+    season: String(finalSeason),
+    episode: String(finalEpisode),
     anilist_id: String(anilistId),
   });
 
@@ -81,10 +106,21 @@ export async function fetchSelfProxy(
   }
 }
 
+// ============ SLUG GENERATION (Spec Rules) ============
+function generateSlug(title: string): string {
+  if (!title) return "";
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")  // remove special chars
+    .trim()
+    .replace(/\s+/g, "-")           // spaces → hyphens
+    .replace(/-+/g, "-")            // collapse hyphens
+    .replace(/^-|-$/g, "");         // trim hyphens
+}
+
 // ============ STRIP PREFIX ============
 // "Anikoto - HD-1" → "HD-1"
 // "ToonStream - FilesForever 1" → "FilesForever 1"
-// If no " - " present → return as-is
 function stripProviderPrefix(name: string): string {
   const trimmed = name.trim();
   const idx = trimmed.lastIndexOf(" - ");
