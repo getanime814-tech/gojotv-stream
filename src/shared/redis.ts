@@ -2,7 +2,11 @@ import type { StreamResponse } from "./types";
 
 // ============================================================
 // UPSTASH REDIS CLIENT — Direct REST API (no SDK)
+// Cache prefix: stream:v2: (bump this on logic changes to
+// invalidate old cache automatically)
 // ============================================================
+
+const CACHE_PREFIX = "stream:v2:";
 
 interface RedisEnv {
   UPSTASH_REDIS_REST_URL: string;
@@ -36,7 +40,7 @@ async function upstashCommand(
 
 // ============ CACHE KEY ============
 export function cacheKey(anilistId: number, episode: number): string {
-  return `stream:${anilistId}:${episode}`;
+  return `${CACHE_PREFIX}${anilistId}:${episode}`;
 }
 
 // ============ GET CACHED ============
