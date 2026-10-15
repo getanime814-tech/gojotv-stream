@@ -1,5 +1,5 @@
 // ============================================================
-// SELF-PROXY API CLIENT — v10 (single call, no dedup)
+// SELF-PROXY API CLIENT — v10.1 (single call, no dedup)
 // ============================================================
 
 import type {
@@ -37,11 +37,12 @@ interface AttemptArgs {
   timeoutMs: number;
 }
 
-// ✅ Servers pushed to the END of their list (less reliable)
-const LOW_PRIORITY_SERVERS = new Set(["cloudy"]);
+// ✅ Servers pushed to END of their list (less reliable)
+// Uses PREFIX match — so "Cloudy", "Cloudy 1", "Cloudy 2" all match
+const LOW_PRIORITY_PREFIXES = ["cloudy"];
 
 // ============================================================
-// MAIN FETCH — single call, no parallel flood
+// MAIN FETCH
 // ============================================================
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
@@ -95,7 +96,7 @@ export async function fetchSelfProxy(
     timeoutMs,
   });
 
-  // Reorder: Cloudy last
+  // Reorder: Cloudy (and variants) last
   result.eng_sub = reorderLowPriority(result.eng_sub);
   result.eng_dub = reorderLowPriority(result.eng_dub);
   result.hindi = reorderLowPriority(result.hindi);
@@ -104,7 +105,7 @@ export async function fetchSelfProxy(
 }
 
 // ============================================================
-// REORDER — Low-priority servers to the end (stable)
+// REORDER — Low-priority servers to the END (stable)
 // ============================================================
 function reorderLowPriority(list: StreamServer[]): StreamServer[] {
   const normal: StreamServer[] = [];
@@ -112,11 +113,12 @@ function reorderLowPriority(list: StreamServer[]): StreamServer[] {
 
   for (const s of list) {
     const name = s.server.toLowerCase().trim();
-    if (LOW_PRIORITY_SERVERS.has(name)) {
-      low.push(s);
-    } else {
-      normal.push(s);
-    }
+    const isLow = LOW_PRIORITY_PREFIXES.some((prefix) =>
+      name.startsWith(prefix)
+    );
+
+    if (isLow) low.push(s);
+    else normal.push(s);
   }
 
   return [...normal, ...low];
@@ -216,7 +218,7 @@ function stripProviderPrefix(name: string): string {
 }
 
 // ============================================================
-// MAP SERVERS — NO DEDUP, keep everything from API
+// MAP SERVERS — NO DEDUP — all servers preserved
 // ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
