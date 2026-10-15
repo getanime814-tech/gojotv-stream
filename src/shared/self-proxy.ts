@@ -1,5 +1,5 @@
 // ============================================================
-// SELF-PROXY API CLIENT — v7 (Cloudy last, fast)
+// SELF-PROXY API CLIENT — v8 (parallel slugs, Cloudy last)
 // ============================================================
 
 import type {
@@ -42,7 +42,7 @@ interface AttemptArgs {
 const LOW_PRIORITY_SERVERS = new Set(["cloudy"]);
 
 // ============================================================
-// MAIN FETCH
+// MAIN FETCH — parallel slug attempts
 // ============================================================
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
@@ -84,16 +84,9 @@ export async function fetchSelfProxy(
 
   if (candidates.length === 0) return emptyResult("empty");
 
-  const aggregated: SelfProxyResult = emptyResult("empty");
-  const seenKeys = new Set<string>();
-  let hasTimeout = false;
-  let hasError = false;
-  let hasAny = false;
-
-  for (const trySlug of candidates) {
-    if (!trySlug) continue;
-
-    const result = await attemptFetch({
+  // ✅ Fire ALL slug attempts in PARALLEL (not sequential)
+  const attemptPromises = candidates.map((trySlug) =>
+    attemptFetch({
       baseUrl: cleanBaseUrl,
       slug: trySlug,
       titleEnglish: safeEnglish,
@@ -102,10 +95,20 @@ export async function fetchSelfProxy(
       episode: finalEpisode,
       anilistId,
       timeoutMs,
-    });
+    })
+  );
 
+  const results = await Promise.all(attemptPromises);
+
+  // Merge all results
+  const aggregated: SelfProxyResult = emptyResult("empty");
+  const seenKeys = new Set<string>();
+  let hasTimeout = false;
+  let hasError = false;
+  let hasAny = false;
+
+  for (const result of results) {
     mergeInto(aggregated, result, seenKeys);
-
     if (result.status === "ok") hasAny = true;
     if (result.status === "timeout") hasTimeout = true;
     if (result.status === "error") hasError = true;
@@ -116,7 +119,7 @@ export async function fetchSelfProxy(
   else if (hasError) aggregated.status = "error";
   else aggregated.status = "empty";
 
-  // ✅ Move cloudy (and other low-priority) servers to the end
+  // ✅ Reorder: Cloudy last
   aggregated.eng_sub = reorderLowPriority(aggregated.eng_sub);
   aggregated.eng_dub = reorderLowPriority(aggregated.eng_dub);
   aggregated.hindi = reorderLowPriority(aggregated.hindi);
@@ -232,7 +235,7 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
 }
 
 // ============================================================
-// HELPERS
+// SLUG GENERATION
 // ============================================================
 function generateSlug(title: string): string {
   if (!title || typeof title !== "string") return "";
@@ -272,7 +275,7 @@ function stripProviderPrefix(name: string): string {
 }
 
 // ============================================================
-// MAP SERVERS
+// MAP SERVERS — dedup by (name + url)
 // ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
