@@ -8,7 +8,15 @@ import type {
 } from "./types";
 
 // ============================================================
-// TATAKAI CLIENT — Final v3
+// TATAKAI CLIENT — Final v5 (95-99% accuracy target)
+//
+// Priority rules:
+//   1. Info endpoint number-match (most accurate)
+//   2. Constructed slug {animeId}-episode-{N} (user's pattern)
+//   3. Info index-match (episode-1 position)
+//   4. Other constructed patterns
+//   5. Info first-entry (LAST RESORT — avoids wrong episodes)
+//   6. Movie bare slug (only if isMovie)
 // ============================================================
 
 interface FetchTatakaiArgs {
@@ -88,7 +96,11 @@ async function fetchHindiDubbed(
   if (!search) return result;
 
   const animeUrl = `${baseUrl}/api/v1/hindidubbed/anime/${search.slug}`;
-  const detail = await fetchJson<HindiDubbedAnimeResponse>(animeUrl, timeoutMs);
+  const detail = await fetchJsonWithRetry<HindiDubbedAnimeResponse>(
+    animeUrl,
+    timeoutMs,
+    1
+  );
 
   if (!detail.ok) {
     result.timedOut = detail.timedOut;
@@ -106,7 +118,8 @@ async function fetchHindiDubbed(
     const list = servers[key];
     if (!Array.isArray(list) || list.length === 0) continue;
 
-    const url = pickServerUrl(list, episode, isMovie);
+    // ✅ SAFE PRIORITY: number-match first, then single-entry/movie
+    const url = pickHindiServerUrl(list, episode, isMovie);
     if (!url) continue;
 
     result.servers.push({
@@ -120,7 +133,7 @@ async function fetchHindiDubbed(
 }
 
 // ============================================================
-// DESI DUB (desidubanime)
+// DESI DUB (desidubanime) — SAFE PRIORITY ORDER
 // ============================================================
 async function fetchDesiDub(
   baseUrl: string,
@@ -141,51 +154,81 @@ async function fetchDesiDub(
   const animeId = search.slug;
 
   // ============================================================
-  // Step 1: Fetch info — get ACTUAL watch slugs
+  // Step 1: Fetch info (to get actual episode IDs)
   // ============================================================
   const infoUrl = `${baseUrl}/api/v1/desidubanime/anime/${animeId}`;
-  const info = await fetchJson<DesiDubInfoResponse>(infoUrl, timeoutMs);
+  const info = await fetchJsonWithRetry<DesiDubInfoResponse>(
+    infoUrl,
+    timeoutMs,
+    1
+  );
 
-  let watchSlugs: string[] = [];
+  // Build slug candidates in SAFE PRIORITY order
+  const candidates: string[] = [];
+  const addSlug = (s: string | undefined | null) => {
+    if (!s || typeof s !== "string") return;
+    const trimmed = s.trim();
+    if (!trimmed || candidates.includes(trimmed)) return;
+    candidates.push(trimmed);
+  };
+
   let movieDetected = isMovie;
+  const infoEpisodes = info.ok ? info.data?.data?.episodes : undefined;
 
-  if (info.ok && info.data?.data?.episodes?.length) {
-    const eps = info.data.data.episodes;
+  // ✅ PRIORITY 1: Info number-match
+  if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
+    const byNumber = infoEpisodes.find((e) => e.number === episode);
+    if (byNumber?.id) addSlug(byNumber.id);
 
-    // ✅ PRIMARY: Try episode number match
-    const matched = eps.find((e) => e.number === episode);
-    if (matched?.id) {
-      watchSlugs.push(matched.id);
-    }
-
-    // ✅ FALLBACK: Use first episode ID (handles broken numbering)
-    // e.g., JJK S2 has only 1 entry with id "jujutsu-kaisen-2nd-season-episode-47"
-    if (eps[0]?.id && !watchSlugs.includes(eps[0].id)) {
-      watchSlugs.push(eps[0].id);
-    }
-
-    if (eps.length === 0 || (eps.length === 1 && eps[0]?.number === 1)) {
+    // Detect movie: single entry with "Movie"/"Full" in title
+    if (
+      infoEpisodes.length === 1 &&
+      /movie|full/i.test(infoEpisodes[0]?.title ?? "")
+    ) {
       movieDetected = true;
     }
+  } else if (info.timedOut) {
+    result.timedOut = true;
   }
 
-  // ✅ LAST RESORT: Construct slug
-  const constructedSlug = `${animeId}-episode-${episode}`;
-  if (!watchSlugs.includes(constructedSlug)) {
-    watchSlugs.push(constructedSlug);
+  // ✅ PRIORITY 2: Constructed slug (user's actual pattern)
+  addSlug(`${animeId}-episode-${episode}`);
+
+  // ✅ PRIORITY 3: Info index-match (episode-1 position)
+  if (
+    Array.isArray(infoEpisodes) &&
+    episode > 0 &&
+    episode <= infoEpisodes.length
+  ) {
+    const byIndex = infoEpisodes[episode - 1];
+    if (byIndex?.id) addSlug(byIndex.id);
   }
 
-  // Movie: also try bare slug
-  if (movieDetected && !watchSlugs.includes(animeId)) {
-    watchSlugs.push(animeId);
+  // ✅ PRIORITY 4: Other constructed patterns
+  addSlug(`${animeId}-${episode}`);
+  addSlug(`${animeId}-ep-${episode}`);
+  addSlug(`${animeId}-episode-${episode}-english`);
+
+  // ✅ PRIORITY 5: Info first-entry (LAST RESORT — wrong episode risk)
+  if (Array.isArray(infoEpisodes) && infoEpisodes.length > 0) {
+    // Only add if episode count suggests single-episode content
+    // OR if constructed patterns matched nothing (we'll try in order anyway)
+    if (infoEpisodes.length === 1 || isMovie) {
+      addSlug(infoEpisodes[0]?.id);
+    }
+  }
+
+  // ✅ PRIORITY 6: Movie bare slug
+  if (movieDetected) {
+    addSlug(animeId);
   }
 
   // ============================================================
-  // Step 2: Try each watch slug until we get sources
+  // Step 2: Try each candidate in order
   // ============================================================
   let sources: Array<{ server: string; url: string }> = [];
 
-  for (const slug of watchSlugs) {
+  for (const slug of candidates) {
     const watch = await fetchJson<DesiDubWatchResponse>(
       `${baseUrl}/api/v1/desidubanime/watch/${slug}`,
       timeoutMs
@@ -199,7 +242,7 @@ async function fetchDesiDub(
     const s = watch.data?.data?.sources;
     if (Array.isArray(s) && s.length > 0) {
       sources = s;
-      break; // ✅ Got sources — stop trying
+      break;
     }
   }
 
@@ -230,9 +273,11 @@ async function fetchDesiDub(
 }
 
 // ============================================================
-// PICK SERVER URL (Hindi Dubbed)
+// PICK HINDI SERVER URL
+// Movie or single-entry → first URL
+// Series → match by episode number, fallback first
 // ============================================================
-function pickServerUrl(
+function pickHindiServerUrl(
   list: Array<{ name: string; url: string }>,
   episode: number,
   isMovie: boolean
@@ -244,13 +289,13 @@ function pickServerUrl(
     return list[0]?.url ?? null;
   }
 
-  // Series → match by episode number
+  // Series → number match
   for (const item of list) {
     const num = parseEpisodeNumber(item.name);
     if (num === episode && item.url) return item.url;
   }
 
-  // Fallback: take first (better than nothing)
+  // Fallback: first (better than empty)
   return list[0]?.url ?? null;
 }
 
@@ -262,7 +307,7 @@ async function searchHindiDubbed(
   titles: string[],
   timeoutMs: number
 ): Promise<{ slug: string; title: string } | null> {
-  const queries = uniqueTitles(titles);
+  const queries = generateTitleVariants(titles);
 
   for (const query of queries) {
     const url = `${baseUrl}/api/v1/hindidubbed/search?title=${encodeURIComponent(query)}`;
@@ -270,12 +315,8 @@ async function searchHindiDubbed(
 
     if (!res.ok || !res.data?.data?.animeList?.length) continue;
 
-    const best = bestTitleMatch(res.data.data.animeList, query);
+    const best = bestTitleMatch(res.data.data.animeList, query, titles);
     if (!best) continue;
-
-    if (!titleMatches(best.title, query) && !isAnyTitleMatch(best.title, queries)) {
-      continue;
-    }
 
     return { slug: best.slug, title: best.title };
   }
@@ -291,7 +332,7 @@ async function searchDesiDub(
   titles: string[],
   timeoutMs: number
 ): Promise<{ slug: string; title: string } | null> {
-  const queries = uniqueTitles(titles);
+  const queries = generateTitleVariants(titles);
 
   for (const query of queries) {
     const url = `${baseUrl}/api/v1/desidubanime/search/${encodeURIComponent(query)}`;
@@ -299,7 +340,7 @@ async function searchDesiDub(
 
     if (!res.ok || !res.data?.data?.results?.length) continue;
 
-    const best = bestTitleMatch(res.data.data.results, query);
+    const best = bestTitleMatch(res.data.data.results, query, titles);
     if (!best) continue;
 
     return { slug: best.id, title: best.title };
@@ -309,29 +350,64 @@ async function searchDesiDub(
 }
 
 // ============================================================
-// HELPERS
+// TITLE VARIANT GENERATOR (10+ per title)
 // ============================================================
-
-function uniqueTitles(titles: string[]): string[] {
+function generateTitleVariants(titles: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const t of titles) {
-    if (!t || typeof t !== "string") continue;
+
+  const push = (t: string | undefined | null) => {
+    if (!t || typeof t !== "string") return;
     const trimmed = t.trim();
-    if (!trimmed) continue;
+    if (!trimmed) return;
     const key = trimmed.toLowerCase();
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
     out.push(trimmed);
+  };
+
+  for (const t of titles) {
+    if (!t) continue;
+
+    push(t);
+
+    // Strip "Season 2", "Part 1", "Cour 2"
+    push(t.replace(/\s+(season|part|cour)\s*\d+/gi, " ").trim());
+
+    // Strip "2nd Season", "3rd Season"
+    push(t.replace(/\s+\d+(?:st|nd|rd|th)\s+season/gi, " ").trim());
+
+    // Strip "Final Season"
+    push(t.replace(/\s+final\s+season/gi, " ").trim());
+
+    // Strip parentheses/brackets
+    push(t.replace(/[\(\[].*?[\)\]]/g, " ").trim());
+
+    // Strip after colon / before colon
+    if (t.includes(":")) {
+      push(t.split(":")[0]?.trim());
+      push(t.split(":").pop()?.trim());
+    }
+
+    // Strip symbols
+    push(t.replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim());
+
+    // First 3 words
+    const words = t.split(/\s+/).filter(Boolean);
+    if (words.length > 3) push(words.slice(0, 3).join(" "));
+
+    // First 2 words (extra fallback)
+    if (words.length > 2) push(words.slice(0, 2).join(" "));
   }
-  return out;
+
+  return out.filter(Boolean);
 }
 
+// ============================================================
+// HELPERS
+// ============================================================
 function normalize(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .trim();
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "").trim();
 }
 
 function titleMatches(returned: string, target: string): boolean {
@@ -347,24 +423,36 @@ function isAnyTitleMatch(returned: string, titles: string[]): boolean {
 
 function bestTitleMatch<T extends { title: string }>(
   results: T[],
-  target: string
+  target: string,
+  originalTitles: string[]
 ): T | null {
   if (!results.length) return null;
 
   const t = normalize(target);
 
+  // 1. Exact match
   const exact = results.find((r) => normalize(r.title) === t);
   if (exact) return exact;
 
+  // 2. Starts with
   const starts = results.find((r) => normalize(r.title).startsWith(t));
   if (starts) return starts;
 
+  // 3. Contains target
   const contains = results.find((r) => normalize(r.title).includes(t));
   if (contains) return contains;
 
+  // 4. Reverse contains (target contains result)
   const revContains = results.find((r) => t.includes(normalize(r.title)));
   if (revContains) return revContains;
 
+  // 5. Match against ORIGINAL titles (validates wrong-anime bug)
+  const validMatch = results.find((r) =>
+    isAnyTitleMatch(r.title, originalTitles)
+  );
+  if (validMatch) return validMatch;
+
+  // 6. Fallback: first result (still return, don't reject)
   return results[0];
 }
 
@@ -403,4 +491,30 @@ async function fetchJson<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJsonWithRetry<T>(
+  url: string,
+  timeoutMs: number,
+  retries = 1
+): Promise<{ ok: boolean; data: T | null; timedOut: boolean }> {
+  let lastResult: { ok: boolean; data: T | null; timedOut: boolean } = {
+    ok: false,
+    data: null,
+    timedOut: false,
+  };
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const result = await fetchJson<T>(url, timeoutMs);
+    lastResult = result;
+
+    if (result.ok && result.data) return result;
+    if (!result.timedOut) return result;
+
+    if (attempt < retries) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+
+  return lastResult;
 }
