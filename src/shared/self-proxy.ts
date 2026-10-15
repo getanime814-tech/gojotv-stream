@@ -1,13 +1,24 @@
+// ============================================================
+// SELF-PROXY API CLIENT — Final v4 (Production Ready)
+// ============================================================
+// Fixes over v3:
+//   • Correct slug priority (DB slug first)
+//   • No early return on error/timeout — tries all candidates
+//   • Strict response validation
+//   • Sanitized base URL
+//   • Optional empty title params skipped
+//   • Detailed debug logging (opt-in)
+//   • Handles all edge cases: 400, 404, 5xx, timeout, malformed JSON
+// ============================================================
+
 import type {
   StreamServer,
   SelfProxyResponse,
 } from "./types";
 
 // ============================================================
-// SELF-PROXY API CLIENT — Final v3
-// Bulletproof multi-slug strategy for 99% accuracy
+// TYPES
 // ============================================================
-
 interface FetchSelfProxyArgs {
   baseUrl: string;
   slug: string;
@@ -18,6 +29,7 @@ interface FetchSelfProxyArgs {
   anilistId: number;
   isMovie: boolean;
   timeoutMs: number;
+  debug?: boolean;
 }
 
 interface SelfProxyResult {
@@ -27,7 +39,21 @@ interface SelfProxyResult {
   status: "ok" | "empty" | "timeout" | "error";
 }
 
-// ============ MAIN FETCH (multi-slug strategy) ============
+interface AttemptArgs {
+  baseUrl: string;
+  slug: string;
+  titleEnglish: string;
+  titleRomaji: string;
+  season: number;
+  episode: number;
+  anilistId: number;
+  timeoutMs: number;
+  debug?: boolean;
+}
+
+// ============================================================
+// MAIN FETCH (multi-slug strategy, bulletproof)
+// ============================================================
 export async function fetchSelfProxy(
   args: FetchSelfProxyArgs
 ): Promise<SelfProxyResult> {
@@ -41,43 +67,69 @@ export async function fetchSelfProxy(
     anilistId,
     isMovie,
     timeoutMs,
+    debug = false,
   } = args;
 
-  // Spec Rule 3 & 7: Movies must be season=1, episode=1
-  const finalSeason = isMovie ? 1 : season;
-  const finalEpisode = isMovie ? 1 : episode;
+  // ---- Guard: Base URL ----
+  if (!baseUrl || typeof baseUrl !== "string") {
+    if (debug) console.warn("[SelfProxy] Missing base URL");
+    return emptyResult("error");
+  }
 
-  // Spec Rule 1: Send both titles separately
-  const safeEnglish = englishTitle?.trim() || romajiTitle?.trim() || "";
-  const safeRomaji = romajiTitle?.trim() || englishTitle?.trim() || "";
+  const cleanBaseUrl = baseUrl.replace(/\/+$/, "").trim();
+  if (!cleanBaseUrl.startsWith("http")) {
+    if (debug) console.warn("[SelfProxy] Invalid base URL:", baseUrl);
+    return emptyResult("error");
+  }
 
-  // ============================================================
-  // Multi-slug candidates in PRIORITY ORDER
-  // ============================================================
-  // Self-proxy uses SLUG as primary key for search, so the right
-  // slug format matters. We try in this order:
-  //   1. English-generated slug (self-proxy's primary expectation)
-  //   2. W6-provided slug (from DB)
-  //   3. Romaji-generated slug (last resort)
-  // ============================================================
-  const candidates = dedupe([
-    generateSlug(safeEnglish),
-    slug?.trim(),
-    generateSlug(safeRomaji),
+  // ---- Spec Rule 3 & 7: Movies must be season=1, episode=1 ----
+  const finalSeason = isMovie ? 1 : Math.max(1, season || 1);
+  const finalEpisode = isMovie ? 1 : Math.max(1, episode || 1);
+
+  // ---- Spec Rule 1: Both titles sent separately ----
+  // Build clean fallback chain (never send empty strings)
+  const rawEnglish = (englishTitle || "").trim();
+  const rawRomaji = (romajiTitle || "").trim();
+  const slugAsTitle = (slug || "").replace(/-/g, " ").trim();
+
+  const safeEnglish = rawEnglish || rawRomaji || slugAsTitle;
+  const safeRomaji = rawRomaji || rawEnglish || slugAsTitle;
+
+  // ---- Multi-slug candidates (PRIORITY ORDER FIXED) ----
+  //   1. DB slug (AniList canonical) — most reliable
+  //   2. English-generated slug
+  //   3. Romaji-generated slug
+  const candidates = dedupeStrings([
+    (slug || "").trim(),
+    generateSlug(rawEnglish),
+    generateSlug(rawRomaji),
   ]);
 
-  let bestResult: SelfProxyResult = {
-    eng_sub: [],
-    eng_dub: [],
-    hindi: [],
-    status: "empty",
-  };
+  if (candidates.length === 0) {
+    if (debug) console.warn("[SelfProxy] No slug candidates generated");
+    return emptyResult("empty");
+  }
 
-  for (const trySlug of candidates) {
+  if (debug) {
+    console.log("[SelfProxy] Candidate slugs:", candidates);
+    console.log("[SelfProxy] Titles:", { english: safeEnglish, romaji: safeRomaji });
+    console.log("[SelfProxy] Season/Episode:", { season: finalSeason, episode: finalEpisode });
+  }
+
+  // ---- Try each slug, keep going on failure ----
+  let bestEmptyResult: SelfProxyResult = emptyResult("empty");
+  let lastErrorResult: SelfProxyResult | null = null;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const trySlug = candidates[i];
     if (!trySlug) continue;
 
+    if (debug) {
+      console.log(`[SelfProxy] Attempt ${i + 1}/${candidates.length}: slug="${trySlug}"`);
+    }
+
     const result = await attemptFetch({
-      baseUrl,
+      baseUrl: cleanBaseUrl,
       slug: trySlug,
       titleEnglish: safeEnglish,
       titleRomaji: safeRomaji,
@@ -85,38 +137,40 @@ export async function fetchSelfProxy(
       episode: finalEpisode,
       anilistId,
       timeoutMs,
+      debug,
     });
 
-    // ✅ Got servers — return immediately (best case)
-    if (result.status === "ok") return result;
-
-    // ✅ Network/server error — don't retry with other slugs
-    // (Different slug won't fix a network error)
-    if (result.status === "error" || result.status === "timeout") {
-      return result;
+    if (debug) {
+      console.log(`[SelfProxy] Result for "${trySlug}": status=${result.status}, servers=${
+        result.eng_sub.length + result.eng_dub.length + result.hindi.length
+      }`);
     }
 
-    // ⚠️ Empty result — remember it, try next slug
-    if (bestResult.status === "empty") {
-      bestResult = result;
+    // ✅ Success — return immediately
+    if (result.status === "ok") return result;
+
+    // ⚠️ Error/timeout — remember, but KEEP TRYING other slugs
+    if (result.status === "error" || result.status === "timeout") {
+      if (!lastErrorResult) lastErrorResult = result;
+      continue;
+    }
+
+    // ⚠️ Empty — remember first empty, try next slug
+    if (result.status === "empty" && bestEmptyResult.status === "empty") {
+      bestEmptyResult = result;
     }
   }
 
-  return bestResult;
+  // All candidates exhausted
+  if (debug) {
+    console.warn("[SelfProxy] All candidates failed. Returning best result.");
+  }
+  return lastErrorResult || bestEmptyResult;
 }
 
-// ============ SINGLE ATTEMPT ============
-interface AttemptArgs {
-  baseUrl: string;
-  slug: string;
-  titleEnglish: string;
-  titleRomaji: string;
-  season: number;
-  episode: number;
-  anilistId: number;
-  timeoutMs: number;
-}
-
+// ============================================================
+// SINGLE ATTEMPT (strict validation)
+// ============================================================
 async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
   const {
     baseUrl,
@@ -127,24 +181,36 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
     episode,
     anilistId,
     timeoutMs,
+    debug = false,
   } = args;
 
-  const params = new URLSearchParams({
-    slug,
-    title_romaji: titleRomaji,
-    title_english: titleEnglish,
-    season: String(season),
-    episode: String(episode),
-    anilist_id: String(anilistId),
-  });
+  // ---- Build query params (only non-empty values) ----
+  const params = new URLSearchParams();
+  params.set("slug", slug);
+  params.set("season", String(season));
+  params.set("episode", String(episode));
+
+  if (titleEnglish && titleEnglish.trim().length > 0) {
+    params.set("title_english", titleEnglish.trim());
+  }
+  if (titleRomaji && titleRomaji.trim().length > 0) {
+    params.set("title_romaji", titleRomaji.trim());
+  }
+  if (anilistId && anilistId > 0) {
+    params.set("anilist_id", String(anilistId));
+  }
 
   const url = `${baseUrl}/api/streaming?${params.toString()}`;
 
+  if (debug) console.log("[SelfProxy] Fetching:", url);
+
+  // ---- Timeout setup ----
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
 
   try {
     const res = await fetch(url, {
+      method: "GET",
       headers: {
         "User-Agent": "GojoTV/2.0",
         Accept: "application/json",
@@ -152,40 +218,77 @@ async function attemptFetch(args: AttemptArgs): Promise<SelfProxyResult> {
       signal: controller.signal,
     });
 
+    // ---- HTTP status handling ----
+    if (res.status === 400 || res.status === 404) {
+      if (debug) console.log(`[SelfProxy] HTTP ${res.status} → empty`);
+      return emptyResult("empty");
+    }
+
     if (!res.ok) {
-      return {
-        eng_sub: [],
-        eng_dub: [],
-        hindi: [],
-        status: res.status === 404 ? "empty" : "error",
-      };
+      if (debug) console.log(`[SelfProxy] HTTP ${res.status} → error`);
+      return emptyResult("error");
     }
 
-    const data = (await res.json()) as SelfProxyResponse;
-
-    if (!data.success || !data.data || !data.data.servers) {
-      return { eng_sub: [], eng_dub: [], hindi: [], status: "empty" };
+    // ---- Parse JSON safely ----
+    let data: SelfProxyResponse;
+    try {
+      data = (await res.json()) as SelfProxyResponse;
+    } catch (jsonErr) {
+      if (debug) console.warn("[SelfProxy] JSON parse error:", jsonErr);
+      return emptyResult("error");
     }
 
+    // ---- Strict response validation ----
+    if (!data || typeof data !== "object") {
+      if (debug) console.warn("[SelfProxy] Invalid response object");
+      return emptyResult("empty");
+    }
+
+    if (data.success !== true) {
+      if (debug) console.log("[SelfProxy] success !== true");
+      return emptyResult("empty");
+    }
+
+    if (!data.data || typeof data.data !== "object") {
+      if (debug) console.log("[SelfProxy] Missing data object");
+      return emptyResult("empty");
+    }
+
+    if (!Array.isArray(data.data.servers)) {
+      if (debug) console.log("[SelfProxy] servers is not an array");
+      return emptyResult("empty");
+    }
+
+    if (data.data.servers.length === 0) {
+      if (debug) console.log("[SelfProxy] Empty servers array");
+      return emptyResult("empty");
+    }
+
+    // ---- Map servers ----
     return mapSelfProxyServers(data.data.servers);
   } catch (err) {
-    const isAbort = err instanceof Error && err.name === "AbortError";
-    return {
-      eng_sub: [],
-      eng_dub: [],
-      hindi: [],
-      status: isAbort ? "timeout" : "error",
-    };
+    const isAbort =
+      err instanceof Error &&
+      (err.name === "AbortError" || err.message.includes("aborted"));
+
+    if (debug) {
+      console.warn("[SelfProxy] Fetch error:", err);
+    }
+
+    return emptyResult(isAbort ? "timeout" : "error");
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ============ SLUG GENERATION (Spec Rules) ============
+// ============================================================
+// SLUG GENERATION (Spec Rules)
+// ============================================================
 function generateSlug(title: string): string {
-  if (!title) return "";
+  if (!title || typeof title !== "string") return "";
   return title
     .toLowerCase()
+    .normalize("NFKD")
     .replace(/[^a-z0-9\s-]/g, "")
     .trim()
     .replace(/\s+/g, "-")
@@ -193,8 +296,10 @@ function generateSlug(title: string): string {
     .replace(/^-|-$/g, "");
 }
 
-// ============ DEDUPE ARRAY ============
-function dedupe(arr: Array<string | undefined>): string[] {
+// ============================================================
+// DEDUPE STRING ARRAY
+// ============================================================
+function dedupeStrings(arr: Array<string | undefined | null>): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const item of arr) {
@@ -207,15 +312,32 @@ function dedupe(arr: Array<string | undefined>): string[] {
   return out;
 }
 
-// ============ STRIP PREFIX ============
+// ============================================================
+// EMPTY RESULT HELPER
+// ============================================================
+function emptyResult(status: SelfProxyResult["status"]): SelfProxyResult {
+  return {
+    eng_sub: [],
+    eng_dub: [],
+    hindi: [],
+    status,
+  };
+}
+
+// ============================================================
+// STRIP PROVIDER PREFIX
+// ============================================================
 function stripProviderPrefix(name: string): string {
+  if (!name || typeof name !== "string") return "";
   const trimmed = name.trim();
   const idx = trimmed.lastIndexOf(" - ");
   if (idx === -1) return trimmed;
   return trimmed.slice(idx + 3).trim();
 }
 
-// ============ MAP SERVERS ============
+// ============================================================
+// MAP SERVERS (grouped by type/language)
+// ============================================================
 function mapSelfProxyServers(
   servers: NonNullable<SelfProxyResponse["data"]>["servers"]
 ): SelfProxyResult {
@@ -223,23 +345,41 @@ function mapSelfProxyServers(
   const eng_dub: StreamServer[] = [];
   const hindi: StreamServer[] = [];
 
+  // Dedupe by URL to avoid duplicate servers
+  const seenUrls = new Set<string>();
+
   for (const s of servers) {
+    if (!s || typeof s !== "object") continue;
     if (!s.embed_url || !s.server_name) continue;
+
+    const url = s.embed_url.trim();
+    if (!url) continue;
+
+    // Skip duplicates
+    if (seenUrls.has(url)) continue;
+    seenUrls.add(url);
 
     const cleanName = stripProviderPrefix(s.server_name);
     if (!cleanName) continue;
 
     const mapped: StreamServer = {
       server: cleanName,
-      url: s.embed_url,
+      url: url,
       source: "self",
     };
 
+    // Group by type + language
     if (s.type === "sub" && s.language === "english") {
       eng_sub.push(mapped);
     } else if (s.type === "dub" && s.language === "english") {
       eng_dub.push(mapped);
     } else if (s.type === "dub" && s.language === "multi-audio") {
+      hindi.push(mapped);
+    } else if (s.type === "sub") {
+      // Fallback: any sub not marked english goes to eng_sub
+      eng_sub.push(mapped);
+    } else if (s.type === "dub") {
+      // Fallback: any dub not marked english/multi goes to hindi
       hindi.push(mapped);
     }
   }
