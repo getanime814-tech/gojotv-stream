@@ -5,7 +5,7 @@ import type {
   PrefetchJob,
   SourceStatus,
 } from "./types";
-import { getRedis, getCached, setCached } from "./redis";
+import { getCached, setCached } from "./redis";
 import { fetchSelfProxy } from "./self-proxy";
 import { fetchAnivexa } from "./anivexa";
 import { fetchTatakai } from "./tatakai";
@@ -20,12 +20,11 @@ export async function resolveStreams(
   env: Env,
   options: { skipCache?: boolean } = {}
 ): Promise<StreamResponse> {
-  const redis = getRedis(env);
   const ttl = parseInt(env.CACHE_TTL_SECONDS, 10);
 
   // 1. Cache check
   if (!options.skipCache) {
-    const cached = await getCached(redis, req.anilist_id, req.episode);
+    const cached = await getCached(env, req.anilist_id, req.episode);
     if (cached) return cached;
   }
 
@@ -112,7 +111,7 @@ export async function resolveStreams(
     merged.eng_sub.length + merged.eng_dub.length + merged.hindi.length;
 
   if (totalServers > 0) {
-    await setCached(redis, req.anilist_id, req.episode, response, ttl);
+    await setCached(env, req.anilist_id, req.episode, response, ttl);
   }
 
   return response;
